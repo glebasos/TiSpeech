@@ -8,8 +8,6 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
-    <!-- Must be x86: TIBASE32.DLL is a 32-bit native DLL -->
-    <PlatformTarget>x86</PlatformTarget>
     <LangVersion>14</LangVersion>
   </PropertyGroup>
 
