@@ -1,13 +1,15 @@
-# TiSpeech
+# TiSpeech — API Reference
 
-A .NET 8 managed wrapper library for **TIBASE32.DLL** — the 32-bit SoftVoice speech synthesis engine originally shipped with Microsoft Talk It!
+A .NET 10 managed wrapper library for **TIBASE32.DLL** — the 32-bit SoftVoice speech synthesis engine originally shipped with Microsoft Talk It!
+
+> **Note:** If your consuming project is AnyCPU or x64, use **TiSpeech.Client** (`TiSpeechClient`) instead of this library directly. `TiSpeechClient` is a drop-in replacement that routes calls through an x86 subprocess, so your app doesn't need to target x86. See the [TiSpeech.Client README](../TiSpeech.Client/README.md).
 
 ## Requirements
 
 | Requirement | Detail |
 |---|---|
 | Platform | Windows only |
-| Architecture | **x86** — TIBASE32.DLL is a 32-bit native DLL; the host process must be compiled as x86 |
+| Architecture | **x86** — TIBASE32.DLL is a 32-bit native DLL; the consuming process must be compiled as x86 |
 | Framework | .NET 10, `net10.0-windows` |
 | Native DLLs | `TIBASE32.DLL`, `TIENG32.DLL` (English), `TISPAN32.DLL` (Spanish), `TIGERM32.DLL` (German) |
 
@@ -35,7 +37,7 @@ if (engine.Open(@"C:\path\to\dlls", TiLanguageFlags.English))
 
 ## Project Setup
 
-Add a reference to `TiSpeech.csproj` and ensure your consuming project also targets x86:
+Add a reference to `TiSpeech.csproj` and ensure your consuming project targets x86:
 
 ```xml
 <PropertyGroup>
