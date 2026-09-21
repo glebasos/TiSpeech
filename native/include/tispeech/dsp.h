@@ -56,7 +56,14 @@ typedef struct {
 } sv_dsp_tables;
 
 /* Each call produces one unsigned 8-bit PCM sample and advances state.
- * noise_a/noise_b are consecutive samples from the original noise table.
+ *
+ * noise_a/noise_b are consecutive int16 samples from the original noise table.
+ * The original keeps that table pointer in its own state block (offset 0x2e4)
+ * and advances it by exactly 4 bytes — two samples — per output sample; this
+ * was measured over 6000 emulated calls, the stride never varied. A caller
+ * driving this kernel must consume the noise table at the same rate or the
+ * frication and aspiration decorrelate from the original.
+ *
  * The caller owns table bounds and frame timing; there are no DLL calls,
  * native audio APIs, instruction interpreters or allocation in this kernel. */
 uint8_t sv_dsp_sample(sv_dsp_state *state, const sv_dsp_tables *tables,

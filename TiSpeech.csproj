@@ -7,14 +7,143 @@
          user32.dll and kernel32.dll), but they use no [SupportedOSPlatform]-annotated
          BCL API and no WinForms, so they compile clean under net10.0 on any host.
          This lets TiSpeech.Client and non-Windows hosts reference the enums and the
-         engine contract without dragging in a Windows-only TFM. -->
+         engine contract without dragging in a Windows-only TFM.
+         TiSpeechNative.cs adds bindings for the PORTABLE native reconstruction
+         (libtispeech.dylib/.so/.dll), which is equally TFM-neutral. -->
     <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>TiSpeech</AssemblyName>
     <RootNamespace>TiSpeech</RootNamespace>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <!-- Required by [LibraryImport] source generation in TiSpeechNative.cs: the
+         generated marshalling stubs use pointers, and the blittable byte*
+         signatures there are declared unsafe so no hidden string/array
+         marshalling sits between us and capi.h. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>14</LangVersion>
   </PropertyGroup>
+
+  <!-- ===================================================================
+       Optional native build: the reconstructed SoftVoice engine.
+
+       TiSpeech/native builds libtispeech.{dylib,so,dll} via CMake. Its English
+       letter-to-sound tables are extracted at build time from an original
+       TIENG32.DLL that the user already owns (repo convention: OpenTalkIt/DLLs/,
+       see OpenTalkIt/DLLs/dll.txt). That DLL is proprietary and is NOT in git.
+
+       Everything below is best-effort and MUST NOT be able to fail a build:
+         * skipped entirely when the DLL, the CMake project, or cmake itself is
+           missing — a contributor without the proprietary DLL still gets a
+           working `dotnet build` and green tests;
+         * every Exec uses IgnoreExitCode so a broken toolchain degrades to
+           "no native library" rather than a build error;
+         * cmake is *probed*, never required — it is not a build dependency.
+
+       When the library does get built it is added as a Content item, which is
+       how it reaches the output folder of this project AND of everything that
+       references it (TiSpeech.Client -> OpenTalkIt -> OpenTalkIt.Tests).
+       TiSpeechNative's DllImport resolver then finds it next to the app.
+       Override with -p:TiSpeechBuildNative=false or TISPEECH_SKIP_NATIVE_BUILD=1.
+       =================================================================== -->
+  <PropertyGroup>
+    <TiSpeechNativeDir>$(MSBuildThisFileDirectory)native</TiSpeechNativeDir>
+    <TiSpeechEngDll Condition="'$(TiSpeechEngDll)' == ''">$(MSBuildThisFileDirectory)..\OpenTalkIt\DLLs\TIENG32.DLL</TiSpeechEngDll>
+    <TiSpeechNativeBuildDir>$(MSBuildThisFileDirectory)obj\native</TiSpeechNativeBuildDir>
+    <TiSpeechNativeInputs>$(TiSpeechNativeBuildDir)\build-inputs.txt</TiSpeechNativeInputs>
+
+    <TiSpeechNativeFileName Condition="$([MSBuild]::IsOSPlatform('Windows'))">tispeech.dll</TiSpeechNativeFileName>
+    <TiSpeechNativeFileName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libtispeech.dylib</TiSpeechNativeFileName>
+    <TiSpeechNativeFileName Condition="'$(TiSpeechNativeFileName)' == ''">libtispeech.so</TiSpeechNativeFileName>
+    <TiSpeechNativeLib>$(TiSpeechNativeBuildDir)\$(TiSpeechNativeFileName)</TiSpeechNativeLib>
+
+    <TiSpeechBuildNative Condition="'$(TiSpeechBuildNative)' == '' AND '$(TISPEECH_SKIP_NATIVE_BUILD)' != ''">false</TiSpeechBuildNative>
+    <TiSpeechBuildNative Condition="'$(TiSpeechBuildNative)' == ''">true</TiSpeechBuildNative>
+  </PropertyGroup>
+
+  <!-- Declared at evaluation time, not inside the target: Inputs/Outputs are
+       resolved before a target runs, so an item created inside it would be
+       empty here and the incremental check would miss source edits. -->
+  <ItemGroup>
+    <TiSpeechNativeSource Include="$(TiSpeechNativeDir)\src\*.c;$(TiSpeechNativeDir)\include\tispeech\*.h;$(TiSpeechNativeDir)\tools\extract_*.py" />
+  </ItemGroup>
+
+  <!-- Path selections are inputs too: changing to a different DLL with an older
+       timestamp must still rebuild the compiled-in language tables. -->
+  <Target Name="PrepareTiSpeechNativeBuild"
+          Condition="'$(TiSpeechBuildNative)' == 'true' AND Exists('$(TiSpeechNativeDir)\CMakeLists.txt') AND Exists('$(TiSpeechEngDll)')">
+    <MakeDir Directories="$(TiSpeechNativeBuildDir)" ContinueOnError="true" />
+    <WriteLinesToFile File="$(TiSpeechNativeInputs)"
+                      Lines="English=$(TiSpeechEngDll);Spanish=$(TiSpeechSpanDll)"
+                      Overwrite="true" WriteOnlyWhenDifferent="true" ContinueOnError="true" />
+  </Target>
+
+  <!-- Is cmake on PATH? Probed with IgnoreExitCode so "no" is silent: no
+       warning, no error, no output. -->
+  <!-- The cmake probe lives INSIDE the build target rather than in a
+       DependsOnTargets prerequisite: MSBuild evaluates a target's Condition
+       before running its dependencies, so a property set by a prerequisite is
+       not visible to the condition that would consume it. -->
+  <Target Name="BuildTiSpeechNative"
+          DependsOnTargets="PrepareTiSpeechNativeBuild"
+          Condition="'$(TiSpeechBuildNative)' == 'true' AND Exists('$(TiSpeechNativeDir)\CMakeLists.txt') AND Exists('$(TiSpeechEngDll)')"
+          Inputs="$(MSBuildProjectFullPath);$(TiSpeechNativeInputs);$(TiSpeechNativeDir)\CMakeLists.txt;$(TiSpeechEngDll);$(TiSpeechSpanDll);@(TiSpeechNativeSource)"
+          Outputs="$(TiSpeechNativeLib)">
+
+    <!-- Is cmake on PATH? IgnoreExitCode makes "no" silent: no warning, no
+         error, no output — cmake is not a build dependency. -->
+    <Exec Command="where cmake" Condition="$([MSBuild]::IsOSPlatform('Windows'))"
+          IgnoreExitCode="true" EchoOff="true"
+          StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ExitCode" PropertyName="_TiSpeechCMakeProbe" />
+    </Exec>
+    <Exec Command="command -v cmake" Condition="!$([MSBuild]::IsOSPlatform('Windows'))"
+          IgnoreExitCode="true" EchoOff="true"
+          StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ExitCode" PropertyName="_TiSpeechCMakeProbe" />
+    </Exec>
+
+    <Message Importance="normal" Condition="'$(_TiSpeechCMakeProbe)' == '0'"
+             Text="TiSpeech: building the native engine reconstruction with CMake ($(TiSpeechEngDll) found)." />
+
+    <Exec Command="cmake -S &quot;$(TiSpeechNativeDir)&quot; -B &quot;$(TiSpeechNativeBuildDir)&quot; -DCMAKE_BUILD_TYPE=Release -DTISPEECH_ENG_DLL=&quot;$(TiSpeechEngDll)&quot;"
+          Condition="'$(_TiSpeechCMakeProbe)' == '0'"
+          IgnoreExitCode="true"
+          StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ExitCode" PropertyName="_TiSpeechConfigureExit" />
+    </Exec>
+
+    <Exec Command="cmake --build &quot;$(TiSpeechNativeBuildDir)&quot; --target tispeech_shared --config Release"
+          Condition="'$(_TiSpeechConfigureExit)' == '0'"
+          IgnoreExitCode="true"
+          StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ExitCode" PropertyName="_TiSpeechBuildExit" />
+    </Exec>
+
+    <!-- Multi-config generators (Visual Studio, Xcode) drop the artifact in a
+         per-configuration subfolder; normalise it to TiSpeechNativeLib so the
+         Content item below has one predictable path. -->
+    <ItemGroup>
+      <_TiSpeechNativeBuilt Include="$(TiSpeechNativeBuildDir)\Release\$(TiSpeechNativeFileName)" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_TiSpeechNativeBuilt)" DestinationFolder="$(TiSpeechNativeBuildDir)"
+          Condition="Exists('$(TiSpeechNativeBuildDir)\Release\$(TiSpeechNativeFileName)')"
+          SkipUnchangedFiles="true" ContinueOnError="true" />
+
+    <Message Importance="normal" Condition="!Exists('$(TiSpeechNativeLib)')"
+             Text="TiSpeech: the native engine reconstruction did not build; continuing without it. The app degrades to 'native library unavailable' at runtime." />
+  </Target>
+
+  <!-- Separate from the build target so the library is picked up on incremental
+       builds too, where BuildTiSpeechNative is skipped as up to date. -->
+  <Target Name="IncludeTiSpeechNativeInOutput" BeforeTargets="AssignTargetPaths"
+          DependsOnTargets="BuildTiSpeechNative">
+    <ItemGroup Condition="Exists('$(TiSpeechNativeLib)')">
+      <Content Include="$(TiSpeechNativeLib)">
+        <Link>$(TiSpeechNativeFileName)</Link>
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <Visible>false</Visible>
+      </Content>
+    </ItemGroup>
+  </Target>
 
 </Project>

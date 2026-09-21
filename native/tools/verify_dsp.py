@@ -104,6 +104,10 @@ def main():
     parser.add_argument("--dll", required=True)
     parser.add_argument("--library", required=True)
     parser.add_argument("--cases", type=int, default=10000)
+    parser.add_argument("--audit-state", action="store_true",
+                        help="also report every byte of the 0x400 state block "
+                             "the original writes that our model does not "
+                             "reproduce, instead of only the known spans")
     args = parser.parse_args()
     if args.cases < 1:
         parser.error("--cases must be positive")
@@ -123,10 +127,12 @@ def main():
     curve = (C.c_uint8 * 401).from_buffer_copy(bytes(uc.mem_read(0x1c0010fe, 401)))
     tables = Tables(source_a, source_b, curve)
     compared = 0
+    unmodelled = {}
     for case in range(args.cases):
         s = State.from_buffer_copy(bytes(rng.randrange(256) for _ in range(C.sizeof(State))))
         noise_a, noise_b = (rng.randrange(-32768, 32768) for _ in range(2))
-        uc.mem_write(STATE, encode_state(s))
+        initial = encode_state(s)
+        uc.mem_write(STATE, initial)
         uc.mem_write(NOISE, struct.pack("<hh", noise_a, noise_b))
         uc.reg_write(UC_X86_REG_EBX, STATE)
         uc.reg_write(UC_X86_REG_EDI, OUTPUT)
@@ -144,8 +150,35 @@ def main():
         for offset, length in spans:
             if original[offset:offset + length] != rebuilt[offset:offset + length]:
                 raise AssertionError(f"case {case}: state mismatch at {offset:#x}")
+        if args.audit_state:
+            # The spans above cover the state we chose to model. Anything the
+            # original writes OUTSIDE them is state we are silently dropping —
+            # harmless for a single sample, potentially not across a frame.
+            # Comparing the whole block is the only way to see it, because our
+            # rebuilt image leaves unmodelled bytes at their initial value.
+            covered = set()
+            for offset, length in spans:
+                covered.update(range(offset, offset + length))
+            for i in range(0x400):
+                if i in covered or original[i] == rebuilt[i]:
+                    continue
+                if original[i] != initial[i]:
+                    unmodelled.setdefault(i, 0)
+                    unmodelled[i] += 1
         compared += 1
     print(f"PASS: {compared} randomized native samples and filter states match the original x86 loop")
+    if args.audit_state:
+        if unmodelled:
+            print(f"AUDIT: the original also writes {len(unmodelled)} byte(s) of "
+                  f"state this reconstruction does not model:")
+            for offset in sorted(unmodelled):
+                print(f"  {offset:#05x}  changed in {unmodelled[offset]}/{compared} cases")
+            print("These are unmodelled, not wrong: the sample output and every "
+                  "modelled field still match. They matter once frames are "
+                  "driven in sequence — see REVERSING.md.")
+        else:
+            print(f"AUDIT: the original writes no state outside the modelled "
+                  f"spans across {compared} cases")
 
 
 if __name__ == "__main__":

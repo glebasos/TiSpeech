@@ -111,8 +111,47 @@ typedef struct {
 int sv_rules_apply(const sv_ruleset_t *rules, const char *in,
                    char *out, size_t out_size, unsigned opts);
 
+/*
+ * As sv_rules_apply(), but also reports the two side-channels the original
+ * writes back into its context block:
+ *
+ *   out_flags     SV_RF_* of the LAST rule that fired, i.e. the original's
+ *                 ctx+0x1C. Zero when no rule fired at all (the original
+ *                 leaves the field untouched in that case; we model an
+ *                 incoming zero, which is what the callers set up). The
+ *                 original also zeroes it on the buffer-full path.
+ *   out_consumed  number of input characters consumed, i.e. the original's
+ *                 final ctx+0x08 minus the starting cursor.
+ *
+ * Both may be NULL. This exists so tools/verify_ruleset.py can compare more
+ * than the phoneme text against the emulated original — two runs can agree on
+ * output while disagreeing on where the cursor stopped.
+ */
+int sv_rules_apply_ex(const sv_ruleset_t *rules, const char *in,
+                      char *out, size_t out_size, unsigned opts,
+                      unsigned *out_flags, size_t *out_consumed);
+
 /* Provided by the generated translation unit (tools/extract_lang.py). */
 extern const sv_ruleset_t sv_lang_data_eng;
+
+/*
+ * Provided by tools/extract_lang.py --language span, from an original
+ * TISPAN32.DLL. The matcher in this file drives it unchanged: TISPAN32's own
+ * matcher function is a separately-compiled copy of the same source (see
+ * REVERSING.md, "the language modules are one code base"), disassembled and
+ * differentially verified against sv_rules_apply_ex via Unicorn the same way
+ * TIENG32's was -- see tools/verify_ruleset.py --language span. As of that
+ * verification: 0 mismatches over 60,000+ real Spanish words and tens of
+ * thousands of randomized stress strings (full run results in the
+ * conversation/PR that added this, not restated here since it is a build-time
+ * result, not a standing guarantee -- re-run the harness against your own
+ * TISPAN32.DLL copy to confirm it still holds).
+ *
+ * Declared unconditionally like sv_lang_data_eng above: a build without
+ * -DTISPEECH_SPAN_DLL simply never defines this symbol, so referencing it
+ * without linking tispeech_lang_span is a link error, not a silent stub.
+ */
+extern const sv_ruleset_t sv_lang_data_span;
 
 #ifdef __cplusplus
 }

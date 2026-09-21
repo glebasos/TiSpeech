@@ -89,21 +89,113 @@ static const unsigned char *sv_skip_rule(const unsigned char *p)
 }
 
 /*
+ * Lowest address any bucket points at, i.e. the first byte of the rule blob.
+ *
+ * In the original the blob is not the start of anything: it sits inside
+ * TIENG32's data section at 0x1C209E22 (which is also bucket 'A', the lowest
+ * of the 26 bucket pointers), and the two bytes below it, 0x1C209E20 and
+ * 0x1C209E21, are both '\'. Those are sentinels. They exist because a LEFT
+ * context is matched walking backwards and is bounded by the previous rule's
+ * terminator — the blob's very first rule has no previous rule, so the table
+ * author put a terminator there by hand.
+ *
+ * tools/extract_lang.py starts its blob at min(buckets, fallback), so the
+ * sentinel is not in our copy and a naive backwards walk would read
+ * rule_blob[-1]. Treating "below the floor" as a terminator reproduces the
+ * sentinel exactly: hitting '\' makes sv_match_context succeed, and so does
+ * this. Without it, ` [A.] =EY5` ` — the first rule in the English blob —
+ * cannot fire, and "A." comes out as " EY5." instead of the original's "EY5".
+ * Found by tools/verify_ruleset.py.
+ */
+static const unsigned char *sv_blob_floor(const sv_ruleset_t *rs)
+{
+    const unsigned char *lo = rs->fallback;
+    int i;
+
+    if (rs->buckets != NULL) {
+        for (i = 0; i < 256; i++) {
+            const unsigned char *b = rs->buckets[i];
+            if (b != NULL && (lo == NULL || b < lo))
+                lo = b;
+        }
+    }
+    return lo;
+}
+
+/*
+ * Read one input byte without ever dereferencing outside [floor, ceil].
+ *
+ * The original always operates on a full sentence buffer, so walking off
+ * either end of the current word still lands on real memory: whitespace the
+ * text normaliser left between words on the left, and more sentence text (or
+ * at minimum a zeroed, generously sized working buffer) on the right. Our
+ * callers can hand us a bare word with no slack on either side -- ASan
+ * caught both directions: a left-context walk reading in_floor[-1] for a
+ * buffer that starts exactly at the word, and the word-boundary loops below
+ * (' ' and 'b') reading one byte past the word's own NUL terminator, because
+ * they always step once before checking for more whitespace.
+ *
+ * We cannot manufacture the original's memory, so we manufacture the SHAPE
+ * every caller who does pad correctly already presents, on both ends:
+ *
+ *   - below floor: exactly one boundary space at floor - 1 (this word has no
+ *     known predecessor, indistinguishable from "this word starts a
+ *     sentence"), then NUL beyond that. Returning ' ' for every position
+ *     below floor -- not just the first -- would make the whitespace-skip
+ *     loops spin forever, since sv_isspace(' ') is always true and there is
+ *     no real byte out there to eventually break on.
+ *   - above ceil (the input's own NUL terminator, computed once as
+ *     in_floor + strlen(in)): NUL. The terminator itself is always safe to
+ *     read; only what would come after it is synthesised.
+ *
+ * This is exactly the shape tools/verify_ruleset.py's frame() already
+ * builds (one real space, then NUL padding, on both sides), so it changes
+ * nothing for a caller who already provides it.
+ */
+static unsigned char sv_peek(const unsigned char *floor, const unsigned char *ceil,
+                             const unsigned char *ip)
+{
+    if (floor != NULL && ip < floor)
+        return (ip == floor - 1) ? (unsigned char)' ' : (unsigned char)'\0';
+    if (ceil != NULL && ip > ceil)
+        return (unsigned char)'\0';
+    return *ip;
+}
+
+/*
  * Verify one context side.
- *   rp      rule cursor, already positioned on the first context character
- *   ip      input cursor
- *   stride  -1 for the left context, +1 for the right context
+ *   rp        rule cursor, already positioned on the first context character
+ *   ip        input cursor
+ *   stride    -1 for the left context, +1 for the right context
+ *   rule_floor first byte of the rule blob; one below it stands in for the
+ *             original's '\' sentinel (see sv_blob_floor). Only the
+ *             backwards walk over the RULE side can reach it.
+ *   in_floor  first byte of the caller's input buffer (sv_rules_apply_ex's
+ *             `in`). Only the backwards walk over the INPUT side can reach
+ *             it; see sv_peek.
+ *   in_ceil   address of the caller's input NUL terminator. Only the
+ *             forwards walk over the INPUT side can read past it; see
+ *             sv_peek.
  * Returns 1 on match (with *rp_end left on the terminator that stopped it),
  * 0 on failure.
  */
 static int sv_match_context(const sv_ruleset_t *rs,
                             const unsigned char *rp, const unsigned char *ip,
-                            int stride, const unsigned char **rp_end)
+                            int stride, const unsigned char *rule_floor,
+                            const unsigned char *in_floor,
+                            const unsigned char *in_ceil,
+                            const unsigned char **rp_end)
 {
     const unsigned short *cc = rs->charclass;
 
     for (;;) {
-        unsigned char rc = *rp;
+        unsigned char rc;
+
+        if (stride < 0 && rule_floor != NULL && rp < rule_floor) {
+            *rp_end = rp; /* the sentinel below the blob; never dereferenced */
+            return 1;
+        }
+        rc = *rp;
         if (rc == CH_BACKSLASH || rc == CH_BACKTICK || rc == CH_EQUALS) {
             *rp_end = rp;
             return 1;
@@ -111,18 +203,18 @@ static int sv_match_context(const sv_ruleset_t *rs,
 
         if ((cc[rc] & SV_CC_METACHAR) == 0) {
             /* Literal character. */
-            if (!sv_chreq(rs, rc, *ip))
+            if (!sv_chreq(rs, rc, sv_peek(in_floor, in_ceil, ip)))
                 return 0;
             ip += stride;
         } else {
-            unsigned char c = *ip;
+            unsigned char c = sv_peek(in_floor, in_ceil, ip);
             switch (rc) {
             case ' ': /* word boundary, then skip whitespace */
                 if ((cc[c] & SV_CC_ALPHA) != 0)
                     return 0;
                 do {
                     ip += stride;
-                } while (sv_isspace(*ip));
+                } while (sv_isspace(sv_peek(in_floor, in_ceil, ip)));
                 break;
 
             case '#': /* one vowel */
@@ -132,6 +224,10 @@ static int sv_match_context(const sv_ruleset_t *rs,
                 break;
 
             case '%': { /* a suffix: ER / E / ELY / ES / ED / ING (+ opt. S) */
+                /* Always reads forward of ip regardless of stride: for the
+                 * left-context walk (ip decreasing) that is back toward
+                 * positions already established as inside the buffer, so no
+                 * in_floor guard is needed here. */
                 int n;
                 if (c == 'E') {
                     unsigned char c1 = ip[1];
@@ -150,14 +246,15 @@ static int sv_match_context(const sv_ruleset_t *rs,
                     return 0;
                 }
                 ip += n;
-                if ((cc[*ip] & SV_CC_ALPHA) != 0)
+                if ((cc[sv_peek(in_floor, in_ceil, ip)] & SV_CC_ALPHA) != 0)
                     return 0;
                 break;
             }
 
             case '&': /* sibilant */
                 if (c == 'H') {
-                    if (ip[-1] != 'C' && ip[-1] != 'S')
+                    unsigned char prev = sv_peek(in_floor, in_ceil, ip - 1);
+                    if (prev != 'C' && prev != 'S')
                         return 0;
                     ip += stride * 2;
                 } else {
@@ -180,7 +277,7 @@ static int sv_match_context(const sv_ruleset_t *rs,
                 break;
 
             case ':': /* zero or more consonants */
-                while ((cc[*ip] & SV_CC_CONSONANT) != 0)
+                while ((cc[sv_peek(in_floor, in_ceil, ip)] & SV_CC_CONSONANT) != 0)
                     ip += stride;
                 break;
 
@@ -204,7 +301,7 @@ static int sv_match_context(const sv_ruleset_t *rs,
 
             case '@': /* consonant that palatalises a following U */
                 if (c == 'H') {
-                    unsigned char prev = ip[-1];
+                    unsigned char prev = sv_peek(in_floor, in_ceil, ip - 1);
                     if (prev != 'T' && prev != 'C' && prev != 'S')
                         return 0;
                     ip += stride * 2;
@@ -226,7 +323,7 @@ static int sv_match_context(const sv_ruleset_t *rs,
                     return 0;
                 do {
                     ip += stride;
-                } while (sv_isspace(*ip));
+                } while (sv_isspace(sv_peek(in_floor, in_ceil, ip)));
                 break;
 
             default:
@@ -237,15 +334,24 @@ static int sv_match_context(const sv_ruleset_t *rs,
     }
 }
 
-int sv_rules_apply(const sv_ruleset_t *rs, const char *in,
-                   char *out, size_t out_size, unsigned opts)
+int sv_rules_apply_ex(const sv_ruleset_t *rs, const char *in,
+                      char *out, size_t out_size, unsigned opts,
+                      unsigned *out_flags, size_t *out_consumed)
 {
-    const unsigned short *cc = rs->charclass;
-    const unsigned char  *p  = (const unsigned char *)in;
-    char                 *op = out;
+    const unsigned short *cc    = rs->charclass;
+    const unsigned char  *p     = (const unsigned char *)in;
+    const unsigned char  *floor = sv_blob_floor(rs);
+    const unsigned char  *in_floor = (const unsigned char *)in;
+    const unsigned char  *in_ceil  = in_floor + strlen(in);
+    char                 *op    = out;
     size_t                out_left;
     int                   used_fallback = 0;
+    unsigned              last_flags = 0;
 
+    if (out_flags != NULL)
+        *out_flags = 0;
+    if (out_consumed != NULL)
+        *out_consumed = 0;
     if (out_size == 0)
         return 1;
     *op = '\0';
@@ -315,7 +421,7 @@ int sv_rules_apply(const sv_ruleset_t *rs, const char *in,
 
                 /* Left context, walking backwards from just before '['. */
                 ip = p - 1;
-                if (!sv_match_context(rs, lb - 1, ip, -1, &rend)) {
+                if (!sv_match_context(rs, lb - 1, ip, -1, floor, in_floor, in_ceil, &rend)) {
                     rp = sv_skip_rule(lit);
                     if (*rp == '\0')
                         goto bucket_done;
@@ -323,7 +429,7 @@ int sv_rules_apply(const sv_ruleset_t *rs, const char *in,
                     continue;
                 }
                 /* Right context, walking forwards from just after ']'. */
-                if (!sv_match_context(rs, lit + 1, q, +1, &rend)) {
+                if (!sv_match_context(rs, lit + 1, q, +1, floor, in_floor, in_ceil, &rend)) {
                     rp = sv_skip_rule(lit);
                     if (*rp == '\0')
                         goto bucket_done;
@@ -360,7 +466,7 @@ int sv_rules_apply(const sv_ruleset_t *rs, const char *in,
                         out_left -= n;
                     }
                     *op = '\0';
-                    (void)flags;
+                    last_flags = flags;
                 }
 
                 p = q; /* consume the literal */
@@ -373,5 +479,15 @@ int sv_rules_apply(const sv_ruleset_t *rs, const char *in,
     }
 
     *op = '\0';
+    if (out_flags != NULL)
+        *out_flags = last_flags;
+    if (out_consumed != NULL)
+        *out_consumed = (size_t)((const char *)p - in);
     return 0;
+}
+
+int sv_rules_apply(const sv_ruleset_t *rs, const char *in,
+                   char *out, size_t out_size, unsigned opts)
+{
+    return sv_rules_apply_ex(rs, in, out, out_size, opts, NULL, NULL);
 }
