@@ -15,10 +15,16 @@
 #include <string.h>
 
 #ifdef TISPEECH_HAVE_ENG
-#  define TISPEECH_LANGS_BUILT TISPEECH_LANG_ENGLISH
+#  define TISPEECH_ENG_BUILT TISPEECH_LANG_ENGLISH
 #else
-#  define TISPEECH_LANGS_BUILT 0u
+#  define TISPEECH_ENG_BUILT 0u
 #endif
+#ifdef TISPEECH_HAVE_SPAN
+#  define TISPEECH_SPAN_BUILT TISPEECH_LANG_SPANISH
+#else
+#  define TISPEECH_SPAN_BUILT 0u
+#endif
+#define TISPEECH_LANGS_BUILT (TISPEECH_ENG_BUILT | TISPEECH_SPAN_BUILT)
 
 uint32_t tispeech_capabilities(void)
 {
@@ -37,8 +43,14 @@ uint32_t tispeech_languages(void)
 
 const char *tispeech_build_info(void)
 {
-#ifdef TISPEECH_HAVE_ENG
+#if defined(TISPEECH_HAVE_ENG) && defined(TISPEECH_HAVE_SPAN)
+    return "tispeech native reconstruction; letter-to-sound: English, Spanish; "
+           "synthesis: not implemented";
+#elif defined(TISPEECH_HAVE_ENG)
     return "tispeech native reconstruction; letter-to-sound: English; "
+           "synthesis: not implemented";
+#elif defined(TISPEECH_HAVE_SPAN)
+    return "tispeech native reconstruction; letter-to-sound: Spanish; "
            "synthesis: not implemented";
 #else
     return "tispeech native reconstruction; letter-to-sound: no language data "
@@ -46,20 +58,19 @@ const char *tispeech_build_info(void)
 #endif
 }
 
-#ifdef TISPEECH_HAVE_ENG
 static const sv_ruleset_t *ruleset_for(uint32_t language)
 {
+#ifdef TISPEECH_HAVE_ENG
     if (language == TISPEECH_LANG_ENGLISH)
         return &sv_lang_data_eng;
-    return NULL;
-}
-#else
-static const sv_ruleset_t *ruleset_for(uint32_t language)
-{
+#endif
+#ifdef TISPEECH_HAVE_SPAN
+    if (language == TISPEECH_LANG_SPANISH)
+        return &sv_lang_data_span;
+#endif
     (void)language;
     return NULL;
 }
-#endif
 
 /* Decode the ABI's UTF-8 into the matcher's Latin-1 bytes, upper-case them,
  * and add word boundaries. This is boundary glue, not the original engine's

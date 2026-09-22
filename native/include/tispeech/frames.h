@@ -36,8 +36,9 @@ extern "C" {
 /* the array with `calloc(nframes, 0x20)` after computing `nframes` as        */
 /* 4 + sum over phonemes of (duration + 4) / 8, and from the field reads in   */
 /* 0x1c0044cb..0x1c004969. Fields marked "unread" are never touched by the    */
-/* renderer; they may still be used by the frame generator or the smoothing   */
-/* passes (0x1c00be40, 0x1c00cd40, 0x1c00de60), which are not reconstructed.  */
+/* renderer; they may still be used by the frame generator or by the one       */
+/* smoothing pass still unreconstructed (0x1c00be40). The two pitch passes,    */
+/* 0x1c00cd40 and 0x1c00de60, are in src/smoothing.c and touch only `pitch`.   */
 /* ------------------------------------------------------------------------ */
 
 typedef struct {

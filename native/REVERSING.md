@@ -264,6 +264,191 @@ passes at `0x1c00be40`, `0x1c00cd40`, `0x1c00de60`. The differential covers
 durations 1..31 at 11025 Hz; other sample rates are exercised only through the
 arithmetic test, not against the DLL.
 
+### `TIENG32!FUN_1c203010` and `FUN_1c203870` — generator leaves — DONE, VERIFIED
+
+Implemented in `src/generator.c`; both entry points, the phoneme-record shape
+and the attribute-flag bits in `include/tispeech/generator.h`.
+
+These are the first two pieces of the missing middle. The middle itself is the
+language module's vtable slot `+0x08` (`TIENG32 0x1C204690`), ~6.4 KB of code
+over 17 parameter tracks, driven by `TIBASE32!FUN_1c005840` — **that is still
+not reconstructed.** What is reconstructed are two leaf functions it calls,
+chosen because each carries real arithmetic rather than bookkeeping:
+
+| Address | Reconstruction | What it does |
+|---|---|---|
+| `0x1C203010` | `sv_gen_phoneme_class()` | phoneme code → one of ten manner classes |
+| `0x1C203870` | `sv_gen_track_contour()` | one parameter track → a per-frame int16 contour |
+| `0x1c20387b` | `sv_gen_crossfade_ramp()` | the contour's first pass alone |
+
+The manner classes are not inferred from the flag names — they are the observed
+partition of the English inventory at `0x1C24D720` (class 0 is every vowel and
+diphthong, 1 approximants, 2 nasals, 3/5 voiced and voiceless fricatives, 4/6
+voiced and voiceless stops, 7 aspirate, 8 glottal stop, 9 silence and
+punctuation), which is what justifies calling them manner classes at all.
+
+`sv_gen_track_contour()` is a crossfade: a forward contour anchored at the
+start of the phoneme, a backward one anchored at its end, mixed by a ramp that
+holds at 256 for `hold_percent` of the frames and falls to zero by
+`fall_percent`. Each pass approaches its target by `(target - v) * rate >> 8`,
+with `rate` read from a 9×16 table. The same wrapping trap `src/dsp.c`
+documents applies throughout: every multiply, add and subtract wraps at 32 bits
+and the final mix wraps at 16 (`addw` at `0x1c2039fc`), so `src/generator.c`
+does each one through an explicit helper rather than trusting C's promotion.
+
+**Status: verified bit-exact.** `tools/verify_generator.py` runs both stages
+under Unicorn and compares output *and* every byte of the module's `.data` the
+original touches — the whole-structure discipline that caught four bugs in the
+frame renderer:
+
+```
+$ python tools/verify_generator.py --dll .../TIENG32.DLL \
+        --library build/libgenerator.dylib --cases 20000 -v
+=== stage class ===
+  classes seen: 0:8558, 1:3317, 2:1895, 3:1383, 4:2197, 5:1488, 6:1864, 7:717, 8:368, 9:18697
+PASS class  40484 cases, 0 mismatches
+=== stage track ===
+  .data audit: 20000 cases, no writes outside ramp/forward/contour
+PASS track  20000 cases, 0 mismatches
+```
+
+Seeded at `0x19961118`. The `.data` audit is the part worth keeping: it asserts
+the original writes nothing outside the ramp, forward and contour buffers we
+model, so an off-by-one that wrote one entry too many would surface as a byte
+outside the claimed spans rather than hide inside a matching output.
+
+Deliberate divergences, each commented at its site: an out-of-range phoneme
+code is refused (`SV_GEN_E_RANGE`) where the original indexes unchecked at
+`0x1c203033`; `hold <= 0` is refused where the original skips the fill at
+`0x1c2038c9` and leaves the buffer stale; rate-table indices are bounds-checked
+where the original reads past the table end. The rate column is *not* clamped
+by the original anywhere, which is why it is validated here instead.
+
+Tables come from `tools/extract_generator.py`, which hardcodes no addresses:
+the phoneme tables are decoded out of `LoadLanguage`'s `mov [eax+disp8], imm32`
+stores, and the rate table is anchored on the ramp constant `mov eax,
+0x01000100` inside `FUN_1c203870`. English and Spanish rate tables are
+byte-identical, consistent with slot `+0x08` being language-independent
+machinery — the same conclusion the vtable comparison below reaches.
+
+**Not covered.** Which of the 17 tracks is which parameter; how the five-record
+window at `ctx+0x20..+0x30` sets each track's endpoints; the caller loop and
+the other helpers (`0x1c201b80`, `0x1c2030b0`, `0x1c249310`). Phoneme record
+fields beyond `+0x04`, `+0x08`, `+0x0c`, `+0x0e` are unread here.
+
+### `TIBASE32!FUN_1c00cd40` — pitch gap interpolation — DONE, VERIFIED
+
+Implemented in `src/smoothing.c` (57 lines); derivation in
+`include/tispeech/smoothing.h`. The first of the post-generation passes: it
+fills runs of zero-pitch frames between nonzero anchors, in Q24.8, with a step
+truncated toward zero exactly as the original's `idiv`.
+
+Two details the differential pinned:
+
+- the terminator check at `0x1c00cd73` comes **before** the run is used, so a
+  trailing run of zero-pitch frames that reaches `SV_FRAME_END` is left
+  untouched rather than interpolated toward the terminator's pitch;
+- the increment precedes the store (`0x1c00cd97`), so the anchor frame itself
+  is never rewritten and exactly the interior frames are filled.
+
+The function has no length argument in the original and none here. It relies on
+the generator setting the terminator's pitch to `0xffff` at `0x1c0058d5`, which
+stops the zero-pitch scan before the `SV_FRAME_END` test. That precondition is
+stated in the header rather than defended at run time, because adding a bound
+would diverge from the original in the one place where its absence is load
+bearing.
+
+```
+$ python tools/verify_smoothing.py --dll .../TIBASE32.DLL \
+        --library build/libsmoothing.dylib --cases 20000
+PASS: 20000 randomized frame arrays match TIBASE32 0x1c00cd40..0x1c00cdb3 byte-for-byte (frame array and state block)
+      longest interior run interpolated: 14 frames
+      trailing zero-run left untouched at least once: True
+      multiple independent runs in one array at least once: True
+```
+
+The call sequence this pass belongs to was recovered at
+`0x1c0039ec..0x1c003a21`: `generate` (`0x1c005840`), `smooth_pitch`
+(`0x1c00cd40`, this pass), then `0x1c00de60` twice, `0x1c00be40`, `0x1c00df10`,
+then `state->restart = 0xff`.
+
+**`0x1c00df10` is a single `retl`.** It is a whole function — the previous one
+ends at `0x1c00df00` and `0x1c00df01..0x1c00df0f` is `int3` padding — and its
+entire body is one return instruction. The engine calls it, cleans up the
+argument, and that is all. Nothing is missing from the reconstruction there;
+the slot is empty in the original. Counting it as an unreconstructed pass, as
+an earlier draft of this file did, overstated what is left.
+
+### `TIBASE32!FUN_1c00de60` — pitch slew — DONE, VERIFIED
+
+Implemented in `src/smoothing.c` as `sv_smooth_pitch_slew()`; derivation in
+`include/tispeech/smoothing.h`. The pass the engine runs **twice** immediately
+after the interpolator (`0x1c003a01`, `0x1c003a0a`, same argument both times).
+Where the interpolator fills gaps with straight lines, this one rounds the
+corners: a one-pole lag over the pitch track, forward and then backward.
+
+```
+acc  = frames[0].pitch << 8                          0x1c00de85
+acc += (frame->pitch - (acc >> 8)) * rate            0x1c00deaf..0x1c00deb4
+frame->pitch = acc >> 8                              0x1c00debb
+```
+
+`rate` is Q8 — 256 snaps to the frame's own value and leaves the track
+untouched, 0 freezes the accumulator at frame 0's pitch — the same convention
+as the generator's interpolation-rate table. Note the shift falls on the
+accumulator *before* the subtract, not on the product after it, which is the
+opposite of `sv_approach()` in `src/generator.c`; writing it the generator's
+way is caught by the differential on the first case.
+
+Three structural details:
+
+- **The accumulator is not reset between the passes.** `0x1c00dec4` decrements
+  the frame counter and leaves `ecx` alone, so the backward pass starts from
+  wherever the forward one ended rather than from the last frame's pitch.
+- **Frame 0 never moves.** The forward pass writes it with a delta of zero
+  (the accumulator was seeded from it), and the backward pass stops one frame
+  short of it.
+- **The rate pair is a voice setting, not something this pass derives.** It is
+  read from `state+0x64`/`state+0x66`, which `0x1c00df20` copies there from
+  the voice parameter block at `state+0xd0` (`+0x18` and `+0x1a` within it).
+
+The two passes select the rate with opposite tests — `jg` at `0x1c00de9c`,
+`jge` at `0x1c00ded7` — which looks like a bug and is not: walking backwards
+inverts the sense, so both passes apply the same rate to the same edge in
+forward time.
+
+**Status: verified bit-exact.**
+
+```
+$ python tools/verify_smoothing.py --dll .../TIBASE32.DLL \
+        --library build/libsmoothing.dylib --cases 20000
+PASS interpolate: 20000 randomized frame arrays match TIBASE32 0x1c00cd40..0x1c00cdb3 byte-for-byte (frame array and state block)
+PASS slew:        20000 randomized pitch tracks match TIBASE32 0x1c00de60..0x1c00df00 byte-for-byte (frame array and state block)
+      input edges seen: 819357 rising, 818651 falling, 1331395 flat
+      cases with out-of-range rates (32-bit wrapping reachable): 4572
+      cases where the pass changed the track: 13532
+```
+
+Seeded at `0x19961118`. Rates are drawn from the engine's own Q8 range, and one
+case in eight from the whole uint16 range, because the reconstruction
+reproduces the original's 32-bit wrapping rather than assuming its caller stays
+in range — those cases are what make the wrap observable.
+
+**One thing the differential does not pin.** Which rate an exact tie
+(`pitch << 8 == acc`) selects is unobservable: the equality implies
+`acc >> 8 == pitch`, so the delta is zero and the step is zero whichever rate
+was chosen. Flipping the backward pass's `>=` to `>` still passes 300 cases.
+Three other mutations were tried as a check that the differential bites —
+swapping the forward pass's two rates, shifting the product the way the
+generator does, and dropping the 32-bit wrap — and all three fail on the first
+or second case, the last one only on an out-of-range rate pair. The code
+follows the instructions; the header records that the choice is unobservable
+rather than claiming the differential proved it.
+
+With this pass and the interpolator done and `0x1c00df10` established as empty,
+**`0x1c00be40` is the only post-generation pass left** — roughly 490
+instructions driven by a table at `0x1c001470`.
+
 ## The language modules are one code base
 
 `TISPAN32` was examined to see what Spanish would cost, since the application
@@ -307,17 +492,32 @@ English module carries a great deal of code the Spanish one does not —
 consistent with a larger dictionary or normaliser rather than a different
 front end.
 
-**What this means for the port:** the reconstructed matcher in `src/ruleset.c`
-should drive Spanish unchanged. What is missing is purely locational —
-`tools/extract_lang.py` hardcodes TIENG32 addresses for `charclass`,
-`bucket_base`, `fallback` and `qmark_sub`, and none of those four are
-descriptor fields, so the Spanish equivalents still have to be found. The
-descriptor itself is the reliable anchor and should be followed rather than
-hardcoded.
+**Spanish matcher: reconstructed and verified.** `tools/extract_lang.py
+--language span` and `tools/verify_ruleset.py --language span` use the Spanish
+matcher at `0x1C4062F0`. Its table addresses were recovered from disassembly:
 
-**Caveat.** This is a structural argument, not a differential test. Nothing
-here has been run against Spanish input, and the rule *data* format is assumed
-rather than shown to be identical. Treat Spanish as cheap-looking, not proven.
+| Table | TISPAN32 VA |
+|---|---|
+| character classes | `0x1C409AA0` |
+| bucket base | `0x1C40E23C` |
+| fallback pointer | `0x1C40E3BC` |
+| question-mark substitution | `0x1C40E3C0` |
+
+The existing `src/ruleset.c` drives these tables unchanged. On 2026-09-22,
+20,000 seeded randomized inputs matched the original Spanish matcher in output
+bytes, flags, return code and consumed input length, with zero mismatches.
+Seven additional Spanish word probes (`hola`, `mundo`, `español`, `niño`,
+`acción`, `pingüino`, `café`) also agreed. This is a matcher differential, not a
+full Spanish front-end test: the isolated original matcher itself stops early
+on some accented inputs, including `NIÑO` (three bytes consumed). The missing
+normalisation/front-end stages are not bypassed by claiming fluent Spanish.
+
+The extractor and oracle existed before this integration; CMake and the C ABI
+now actually enable them through `TISPEECH_SPAN_DLL`. English and Spanish can
+be built independently or together; capabilities and language selection report
+exactly what was compiled. The managed build passes each available language
+DLL independently. `test_capi` exercises the UTF-8 boundary in either language,
+plus oracle-confirmed Spanish outputs.
 
 ## Open questions
 
@@ -330,8 +530,8 @@ rather than shown to be identical. Treat Spanish as cheap-looking, not proven.
      fires first under first-match-wins, so the `[BEFORE]=BIXFOH3R` entry is
      unreachable in the original table. Confirmed by direct probe against
      `TIENG32.DLL` — original and reconstruction agree byte for byte.
-   - Still open in the same area: the Spanish module (`TISPAN32`) has not been
-     put through the same differential.
+   - Spanish is now also covered: 20,000 randomized strings and seven word
+     probes agree with `TISPAN32` (see above); its complete front end is not ported.
 2. **`sv_language` vtable semantics.** Field kinds (code vs. data) are certain;
    what the four functions *do* is inferred from call-site context only. Left
    deliberately typed as opaque rather than guessed into a wrong signature.
@@ -347,25 +547,42 @@ rather than shown to be identical. Treat Spanish as cheap-looking, not proven.
 5. **Coverage.** `TIBASE32`'s Ghidra map has large unmapped gaps
    (`0x1C0010A2`–`0x1C0036F0`, `0x1C005DE4`–`0x1C00BE40`). Those are data or
    hand-written assembly; do not assume the decompilation is complete.
+6. **What the 17 parameter tracks are.** `sv_gen_track_contour()` reproduces a
+   track's contour exactly without knowing which track is F1 and which is
+   voicing amplitude. The mapping lives in the generator driver's one-time init
+   at `0x1c2049a9`, and until it is read the reconstructed stage produces
+   correct numbers for an unnamed quantity.
+7. **Phoneme record fields.** `+0x04`, `+0x08`, `+0x0c`, `+0x0e` are
+   established; the rest of the 26-byte record, and bytes `+0x06..+0x19` of a
+   phoneme *definition* entry, are the per-phoneme parameter targets and are
+   unread by anything reconstructed so far.
+8. **The last post-generation pass.** `0x1c00be40`, ~490 instructions over a
+   table at `0x1c001470`, is the only one of the five calls at `0x1c0039ec`
+   still unreconstructed: `0x1c00cd40` and `0x1c00de60` are done and
+   `0x1c00df10` turned out to be a bare `retl`.
 
 ## Not started
 
-Text normalisation (numbers, abbreviations), the user dictionary, phoneme →
-parameter-frame generation, and the whole `TIBASE32` public API beyond its
-declared surface.
+Text normalisation (numbers, abbreviations), the user dictionary, the
+generator driver at `0x1C204690` that would turn the reconstructed leaves into
+actual parameter frames, the last post-generation pass (`0x1c00be40`), and the
+whole `TIBASE32` public API beyond its declared surface.
 
 The pipeline now has working ends and a missing middle:
 
 | Stage | Status |
 |---|---|
-| text → phonemes | reconstructed and verified bit-exact (`src/ruleset.c`), English only |
-| phonemes → parameter frames | **not started** |
+| text → phonemes | matcher reconstructed and verified bit-exact (`src/ruleset.c`), English and Spanish; full front ends still missing |
+| phonemes → parameter frames | **the missing middle.** Two leaf stages reconstructed and verified bit-exact (`src/generator.c`), plus both pitch passes (`src/smoothing.c`); the 6.4 KB driver at `0x1C204690` and one post-generation pass (`0x1c00be40`) are not started |
 | parameter frames → PCM | reconstructed and verified bit-exact (`src/frames.c`, `src/dsp.c`) |
 | PCM → audio device | not started |
 
 The missing middle has a name: it is the language module's vtable slot `+0x08`,
 driven by `TIBASE32!FUN_1c005840`. The frame stage below it *consumes* frames;
-nothing yet *produces* them.
+nothing yet *produces* them. Two of its leaves and the first pass that runs
+after it are now reconstructed and verified (see above), which establishes the
+data shapes it works in — 26-byte phoneme records, 17 parameter tracks, a 9×16
+interpolation-rate table — without yet producing a single frame.
 
 Until the middle stage lands, `tispeech_synthesize()` in `src/capi.c` returns
 `TISPEECH_E_NOTIMPL` and the application keeps Talk disabled off Windows.
@@ -388,10 +605,10 @@ actually in use:
   the decisive tool: `tools/verify_dsp.py` is the pattern every future
   reconstruction should copy — map the real DLL, run the original function,
   call the C reconstruction through `ctypes`, compare output *and* state.
-  That pattern has since been copied twice, and both times the whole-state
-  comparison caught fidelity bugs an output-only check had missed:
-  `tools/verify_frames.py` for the frame renderer and `tools/verify_ruleset.py`
-  for the letter-to-sound matcher. Write the differential before believing a
+  That pattern has since been copied four times — `verify_frames.py`,
+  `verify_ruleset.py`, `verify_generator.py`, `verify_smoothing.py` — and in the
+  frame renderer the whole-state comparison caught four fidelity bugs an
+  output-only check had missed. Write the differential before believing a
   reconstruction, not after.
 
 Nothing in this list is a runtime dependency. The shipped library links no
@@ -401,23 +618,25 @@ emulator and parses no DLL at run time.
 
 ```sh
 cmake -B build -DTISPEECH_ENG_DLL=/path/to/TIENG32.DLL \
+               -DTISPEECH_SPAN_DLL=/path/to/TISPAN32.DLL \
                -DTISPEECH_BASE_DLL=/path/to/TIBASE32.DLL
 cmake --build build
 ctest --test-dir build
 ./build/svphon "hello world"
 ```
 
-Both DLL paths are optional and independent, and neither is committed — each is
+All three DLL paths are optional and independent, and none is committed — each is
 parsed as a file at build time, never loaded or executed. What you pass decides
 what gets built:
 
 | Set | Adds |
 |---|---|
-| neither | rule engine, DSP, frame renderer, shared library; `capi` test only |
-| `TISPEECH_ENG_DLL` | English rule data, `svphon`, `ruleset` test |
+| none | rule engine, DSP, frame renderer, generator stages, pitch smoothing, shared library; `capi`, `generator` and `smoothing` tests (their fixtures are synthetic) |
+| `TISPEECH_ENG_DLL` | English rule data, English generator tables, `svphon`, `ruleset` test, the real-inventory cases in the `generator` test |
+| `TISPEECH_SPAN_DLL` | Spanish rule data and Spanish ABI checks in `capi` |
 | `TISPEECH_BASE_DLL` | base coefficient tables, `frames` test |
 
-The library code always compiles without either: callers supply the tables at
+The library code always compiles without any DLLs: callers supply the tables at
 the C boundary. Only the generated data libraries and the tests that need them
 are gated. Python is required only when at least one DLL is set.
 
@@ -437,7 +656,24 @@ also reject embedded NULs rather than silently converting only a prefix.
 language data (capability, argument, and not-implemented checks).
 
 Verifying the reconstruction against the original (development only, needs
-`unicorn`):
+`unicorn` and `pefile` in the selected Python environment):
+
+```sh
+cmake -S . -B build-oracle \
+  -DTISPEECH_ENG_DLL=/path/to/TIENG32.DLL \
+  -DTISPEECH_SPAN_DLL=/path/to/TISPAN32.DLL \
+  -DTISPEECH_BASE_DLL=/path/to/TIBASE32.DLL \
+  -DTISPEECH_VERIFY_ORIGINAL=ON \
+  -DPython3_EXECUTABLE=/path/to/venv/bin/python
+cmake --build build-oracle
+ctest --test-dir build-oracle --output-on-failure -L differential
+```
+
+This opt-in builds separate ctypes oracle libraries, never used by the app.
+`TISPEECH_VERIFY_CASES` defaults to 20,000. Only supplied DLLs enable tests;
+the rule tests use randomized inputs so they require no system dictionary.
+Normal builds remain independent of Unicorn. The broader English dictionary
+cohort and individual stages can still be run manually:
 
 ```sh
 cc -shared -fPIC -std=c11 -Iinclude src/dsp.c -o build/libdsp.dylib
@@ -452,7 +688,26 @@ cc -shared -fPIC -std=c11 -Wall -Wextra -Iinclude \
    src/ruleset.c build/eng_lang_data.c -o build/librules_eng.dylib
 python tools/verify_ruleset.py --dll /path/to/TIENG32.DLL \
        --library build/librules_eng.dylib
+
+cc -shared -fPIC -std=c11 -Wall -Wextra -Iinclude \
+   src/ruleset.c build/span_lang_data.c -o build/librules_span.dylib
+python tools/verify_ruleset.py --dll /path/to/TISPAN32.DLL --language span \
+       --library build/librules_span.dylib --words '' --cases 0 --random-cases 20000
+
+cc -shared -fPIC -std=c11 -Wall -Wextra -Wconversion -Iinclude \
+   src/generator.c -o build/libgenerator.dylib
+python tools/verify_generator.py --dll /path/to/TIENG32.DLL \
+       --library build/libgenerator.dylib --cases 20000 -v
+
+cc -shared -fPIC -std=c11 -Wall -Wextra -Wconversion -Iinclude \
+   src/smoothing.c -o build/libsmoothing.dylib
+python tools/verify_smoothing.py --dll /path/to/TIBASE32.DLL \
+       --library build/libsmoothing.dylib --cases 20000
 ```
+
+`verify_smoothing.py` takes `--stage interpolate|slew|all`, and
+`verify_generator.py` takes `--stage class|track|all`; the latter's `-v` prints
+the manner-class histogram and the `.data` audit summary.
 
 `verify_ruleset.py` also takes `--probe WORD` (repeatable) to compare a single
 input against the original and print both results side by side, which is the

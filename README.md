@@ -5,10 +5,16 @@ A .NET 10 library for the SoftVoice speech engine originally shipped with Micros
 ## Portable reconstruction
 
 `native/` contains reconstructed letter-to-sound rules, the fixed-point waveform
-kernel, and a frame renderer. `TiSpeechNative` exposes the available stages
+kernel, a frame renderer, two leaf stages of the phoneme-to-frame generator and
+both pitch-smoothing passes that follow it — each verified bit-exact against the
+original DLLs. `TiSpeechNative` exposes the available stages
 through a C ABI; `NativeTiSpeechBackend` implements the application's shared
-backend interfaces. Phoneme previews work when language data is built in.
-**Speech synthesis is not available yet:** the phoneme-to-frame generator and
+backend interfaces. English and Spanish phoneme previews work when their
+respective language data is built in (`TISPEECH_ENG_DLL` / `TISPEECH_SPAN_DLL`
+for CMake, `TiSpeechEngDll` / `TiSpeechSpanDll` for MSBuild). These expose the
+letter-to-sound matcher, not the original engine's complete text normaliser.
+**Speech synthesis is not available yet:** the generator driver that would turn
+those stages into parameter frames, the last post-generation pass, and the
 native playback path are still missing. `Synthesize` returns `NotImplemented`,
 with no audio buffer or substitute voice.
 

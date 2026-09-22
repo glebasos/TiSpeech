@@ -26,10 +26,10 @@
   <!-- ===================================================================
        Optional native build: the reconstructed SoftVoice engine.
 
-       TiSpeech/native builds libtispeech.{dylib,so,dll} via CMake. Its English
-       letter-to-sound tables are extracted at build time from an original
-       TIENG32.DLL that the user already owns (repo convention: OpenTalkIt/DLLs/,
-       see OpenTalkIt/DLLs/dll.txt). That DLL is proprietary and is NOT in git.
+       TiSpeech/native builds libtispeech.{dylib,so,dll} via CMake. English and
+       Spanish letter-to-sound tables are extracted at build time from original
+       TIENG32.DLL / TISPAN32.DLL copies the user already owns (repo convention:
+       OpenTalkIt/DLLs/, see OpenTalkIt/DLLs/dll.txt). Neither DLL is in git.
 
        Everything below is best-effort and MUST NOT be able to fail a build:
          * skipped entirely when the DLL, the CMake project, or cmake itself is
@@ -48,6 +48,9 @@
   <PropertyGroup>
     <TiSpeechNativeDir>$(MSBuildThisFileDirectory)native</TiSpeechNativeDir>
     <TiSpeechEngDll Condition="'$(TiSpeechEngDll)' == ''">$(MSBuildThisFileDirectory)..\OpenTalkIt\DLLs\TIENG32.DLL</TiSpeechEngDll>
+    <TiSpeechSpanDll Condition="'$(TiSpeechSpanDll)' == ''">$(MSBuildThisFileDirectory)..\OpenTalkIt\DLLs\TISPAN32.DLL</TiSpeechSpanDll>
+    <_TiSpeechAvailableEngDll Condition="Exists('$(TiSpeechEngDll)')">$(TiSpeechEngDll)</_TiSpeechAvailableEngDll>
+    <_TiSpeechAvailableSpanDll Condition="Exists('$(TiSpeechSpanDll)')">$(TiSpeechSpanDll)</_TiSpeechAvailableSpanDll>
     <TiSpeechNativeBuildDir>$(MSBuildThisFileDirectory)obj\native</TiSpeechNativeBuildDir>
     <TiSpeechNativeInputs>$(TiSpeechNativeBuildDir)\build-inputs.txt</TiSpeechNativeInputs>
 
@@ -70,10 +73,10 @@
   <!-- Path selections are inputs too: changing to a different DLL with an older
        timestamp must still rebuild the compiled-in language tables. -->
   <Target Name="PrepareTiSpeechNativeBuild"
-          Condition="'$(TiSpeechBuildNative)' == 'true' AND Exists('$(TiSpeechNativeDir)\CMakeLists.txt') AND Exists('$(TiSpeechEngDll)')">
+          Condition="'$(TiSpeechBuildNative)' == 'true' AND Exists('$(TiSpeechNativeDir)\CMakeLists.txt') AND (Exists('$(TiSpeechEngDll)') OR Exists('$(TiSpeechSpanDll)'))">
     <MakeDir Directories="$(TiSpeechNativeBuildDir)" ContinueOnError="true" />
     <WriteLinesToFile File="$(TiSpeechNativeInputs)"
-                      Lines="English=$(TiSpeechEngDll);Spanish=$(TiSpeechSpanDll)"
+                      Lines="English=$(_TiSpeechAvailableEngDll);Spanish=$(_TiSpeechAvailableSpanDll)"
                       Overwrite="true" WriteOnlyWhenDifferent="true" ContinueOnError="true" />
   </Target>
 
@@ -85,8 +88,8 @@
        not visible to the condition that would consume it. -->
   <Target Name="BuildTiSpeechNative"
           DependsOnTargets="PrepareTiSpeechNativeBuild"
-          Condition="'$(TiSpeechBuildNative)' == 'true' AND Exists('$(TiSpeechNativeDir)\CMakeLists.txt') AND Exists('$(TiSpeechEngDll)')"
-          Inputs="$(MSBuildProjectFullPath);$(TiSpeechNativeInputs);$(TiSpeechNativeDir)\CMakeLists.txt;$(TiSpeechEngDll);$(TiSpeechSpanDll);@(TiSpeechNativeSource)"
+          Condition="'$(TiSpeechBuildNative)' == 'true' AND Exists('$(TiSpeechNativeDir)\CMakeLists.txt') AND (Exists('$(TiSpeechEngDll)') OR Exists('$(TiSpeechSpanDll)'))"
+          Inputs="$(MSBuildProjectFullPath);$(TiSpeechNativeInputs);$(TiSpeechNativeDir)\CMakeLists.txt;$(_TiSpeechAvailableEngDll);$(_TiSpeechAvailableSpanDll);@(TiSpeechNativeSource)"
           Outputs="$(TiSpeechNativeLib)">
 
     <!-- Is cmake on PATH? IgnoreExitCode makes "no" silent: no warning, no
@@ -103,9 +106,9 @@
     </Exec>
 
     <Message Importance="normal" Condition="'$(_TiSpeechCMakeProbe)' == '0'"
-             Text="TiSpeech: building the native engine reconstruction with CMake ($(TiSpeechEngDll) found)." />
+             Text="TiSpeech: building the native engine reconstruction with CMake (using available language DLLs)." />
 
-    <Exec Command="cmake -S &quot;$(TiSpeechNativeDir)&quot; -B &quot;$(TiSpeechNativeBuildDir)&quot; -DCMAKE_BUILD_TYPE=Release -DTISPEECH_ENG_DLL=&quot;$(TiSpeechEngDll)&quot;"
+    <Exec Command="cmake -S &quot;$(TiSpeechNativeDir)&quot; -B &quot;$(TiSpeechNativeBuildDir)&quot; -DCMAKE_BUILD_TYPE=Release -DTISPEECH_ENG_DLL=&quot;$(_TiSpeechAvailableEngDll)&quot; -DTISPEECH_SPAN_DLL=&quot;$(_TiSpeechAvailableSpanDll)&quot;"
           Condition="'$(_TiSpeechCMakeProbe)' == '0'"
           IgnoreExitCode="true"
           StandardOutputImportance="low" StandardErrorImportance="low">

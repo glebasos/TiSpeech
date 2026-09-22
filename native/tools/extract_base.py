@@ -62,6 +62,15 @@ PHONEME_PTRS = 0x1C012A68
 PHONEME_LISTS = 0x3C
 FRAME_RATE = 0x1C0120E8
 
+# Voice-expression tables, TIBASE32!FUN_1c00be40. Bounds derived in
+# include/tispeech/expression.h; VOICE_ROWS is additionally checked below
+# against the NULL name pointer that ends the table.
+FLUTTER = (0x1C001470, 0x100)
+LFO = (0x1C013430, 0x100)
+VOICES = (0x1C013600, 74)
+VOICE_ROWS = 20
+SOURCE_MAP = (0x1C012EE8, 0x10E * 5)
+
 # src/frames.c inlines these two as SV_FRAME_RATE_NUMERATOR/DENOMINATOR.
 EXPECTED_RATE = (150, 60)
 
@@ -133,6 +142,33 @@ def check_build(pe):
     if rate != EXPECTED_RATE:
         raise SystemExit(f"frame-rate constants at {FRAME_RATE:#x} are {rate}, "
                          f"but src/frames.c inlines {EXPECTED_RATE}")
+
+
+def expression_tables(pe):
+    """The four tables the voice-expression pass reads.
+
+    The voice table's row count is not written down anywhere in the code --
+    FUN_1c00be40 indexes it unchecked. What ends it is a row whose name pointer
+    is NULL, so that is what this asserts: 20 rows with a name, then one
+    without. If a different build has more voices this fails loudly rather than
+    truncating the table."""
+    for row in range(VOICE_ROWS):
+        if pe.u32(VOICES[0] + row * VOICES[1]) == 0:
+            raise SystemExit(
+                f"voice table: row {row} has a NULL name pointer, expected "
+                f"{VOICE_ROWS} named rows")
+    if pe.u32(VOICES[0] + VOICE_ROWS * VOICES[1]) != 0:
+        raise SystemExit(
+            f"voice table: row {VOICE_ROWS} has a name pointer, so the table "
+            f"is longer than the {VOICE_ROWS} rows this build expects")
+
+    # The source map ends two bytes before the LFO table; if that stopped being
+    # true the derived bound on its length would be wrong.
+    if SOURCE_MAP[0] + SOURCE_MAP[1] + 2 != LFO[0]:
+        raise SystemExit("source map and LFO table are no longer adjacent")
+
+    return (pe.read(*FLUTTER), pe.read(*LFO),
+            pe.read(VOICES[0], VOICES[1] * VOICE_ROWS), pe.read(*SOURCE_MAP))
 
 
 def glottal_tables(pe):
@@ -222,6 +258,7 @@ def main():
     noise = struct.unpack(f"<{NOISE[1]}h", pe.read(NOISE[0], NOISE[1] * 2))
     glottal = glottal_tables(pe)
     names = phoneme_lists(pe)
+    flutter, lfo, voices, source_map = expression_tables(pe)
 
     with open(args.out, "w") as out:
         out.write(f"""\
@@ -231,6 +268,7 @@ def main():
  * extracted at build time from a copy the user already has. It is written into
  * the build tree and nowhere else. See native/REVERSING.md.
  */
+#include "tispeech/expression.h"
 #include "tispeech/frames.h"
 
 """)
@@ -249,6 +287,14 @@ def main():
                   "    resonator, amplitude, glottal, noise, output_curve\n"
                   "};\n\n")
 
+        emit_bytes(out, "flutter", flutter)
+        emit_bytes(out, "lfo", lfo)
+        emit_bytes(out, "voices", voices)
+        emit_bytes(out, "source_map", source_map)
+        out.write(f"const sv_expr_tables {args.symbol}_expression = {{\n"
+                  "    flutter, lfo, voices, source_map\n"
+                  "};\n\n")
+
         for i, pairs in enumerate(names):
             if pairs is not None:
                 emit_bytes(out, f"phoneme_{i:02x}", pairs)
@@ -261,6 +307,7 @@ def main():
         f"extract_base.py: {args.out}: {len(resonator)} coefficient bytes, "
         f"{len(amplitude)} amplitude bytes, {len(glottal)} glottal waveforms, "
         f"{len(noise)} noise samples, "
+        f"{VOICE_ROWS} voices, "
         f"{sum(1 for n in names if n)} phoneme lists\n")
 
 

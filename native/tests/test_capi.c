@@ -77,7 +77,13 @@ int main(void)
 #endif
 #ifdef TISPEECH_HAVE_SPAN
     CHECK((languages & TISPEECH_LANG_SPANISH) != 0);
+    CHECK(strstr(tispeech_build_info(), "Spanish") != NULL);
     CHECK(check_language(TISPEECH_LANG_SPANISH, &sv_lang_data_span) == 0);
+    /* Confirmed by TISPAN32!0x1c4062f0 oracle probes, not another C path. */
+    CHECK(tispeech_text_to_phonemes(TISPEECH_LANG_SPANISH, "hola mundo", output, sizeof(output)) == TISPEECH_OK);
+    CHECK(strcmp(output, "OHLAA MUWNDOH") == 0);
+    CHECK(tispeech_text_to_phonemes(TISPEECH_LANG_SPANISH, "caf\xc3\xa9", output, sizeof(output)) == TISPEECH_OK);
+    CHECK(strcmp(output, "KAAFEH5") == 0);
 #else
     CHECK((languages & TISPEECH_LANG_SPANISH) == 0);
     CHECK(tispeech_text_to_phonemes(TISPEECH_LANG_SPANISH, "hola", output, sizeof(output)) == TISPEECH_E_NOLANGUAGE);
