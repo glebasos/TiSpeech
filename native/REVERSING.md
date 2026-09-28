@@ -549,7 +549,7 @@ whenever TIENG32 data is supplied. It reconstructs TIBASE32 `SVTextToPhon`
 TIENG32's word translator (`0x1c2067c0`): exception pronunciations, number
 normalisation and format handlers, letter-to-sound rules, and default stress.
 The source also contains spell mode and command passthrough; the public ABI
-currently selects the ordinary flags=0 path. User dictionaries remain absent.
+currently selects the ordinary flags=0 path. User dictionaries: see below.
 
 The English `.data` image and read-only `.text` tables are extracted even
 without TIBASE32, so text conversion does not require synthesis data. Each
@@ -579,6 +579,54 @@ instead, and the managed wrapper explains the limit. UTF-8 decoding still
 rejects malformed and non-Latin-1 input. Too-small caller buffers return
 `TISPEECH_E_BUFFERFULL` with an empty result. Inline commands can be converted
 to phoneme text, but synthesis still rejects them with `NOTIMPL`.
+
+### User dictionaries — DONE, VERIFIED (2026-09-28)
+
+`src/userdict.c`; file format and lookup semantics in
+`include/tispeech/userdict.h`. Reconstructs the format half of
+`TIBASE32!_SVLoadUserDictionary@8` (`0x1c0101a0`, everything after its
+fopen/fread/fclose; this library does no file I/O) and the lookup,
+`TIENG32!FUN_1c2097a0`, which the per-word driver (`0x1c2067c0`) calls
+*before* the built-in exception dictionary. `_SVUnloadUserDictionary@8`
+(`0x1c010450`) is a free-and-clear that ignores its path argument entirely.
+
+One dictionary slot per handle: loading auto-unloads whatever was there.
+File: magic `SVXF` + 5 unvalidated fields + an enable flag + a table byte
+length + 28 bucket offsets (26 letters, digit-initial, default) + the table.
+Entries are `[H0][H1][H2][word][phonemes]`, `H1 == 0` terminating a bucket;
+H2 bit 0 selects original- vs normalised-text comparison, bit 1 a real entry
+vs. a reserved slot. Letter buckets must be sorted and get a
+case-insensitive early exit on mismatch; the digit and default buckets do
+not (confirmed: an out-of-order pair only fails in a letter bucket). A match
+chains: one lookup call consumes every consecutive dictionary word before
+falling through to the normal pipeline. A match skips default stress, as the
+built-in exceptions do.
+
+```sh
+python tools/verify_narrate.py --dlls /path/to/dll/dir --library dummy \
+  --user-dict-library build/libverify_userdict.dylib
+```
+
+18 cases against the original, 0 mismatches (ctest `original_userdict`):
+letter/digit/default buckets, prefix vs. word boundary, both comparison
+modes, out-of-order rejection, the bad-magic/truncated errors (`0x1b6c` /
+`0x1b6b`), and the no-dictionary baseline. `test_userdict` covers the parser
+without DLLs.
+
+Public ABI: `tispeech_userdict_load(bytes, size, &dict)` /
+`tispeech_userdict_free` and `tispeech_text_to_phonemes_ex(language, text,
+dict, out, size)`; managed `TiUserDictionary` and
+`NativeTiSpeechBackend.LoadUserDictionary(path)`, which applies to phoneme
+previews and speech. English only for now; a dictionary with Spanish returns
+`NOTIMPL`.
+
+**Deliberate divergence.** The original's per-letter bucket index
+(`handle+0x28 + ch*4 - 0xfc`) is only valid for ASCII `A`-`Z`. Fifteen
+Latin-1 letters the normaliser preserves carry the same alphabetic class bit
+and index out of bounds in the original, into whatever follows the speech
+handle. That depends on unrelated heap contents, not the dictionary file, so
+a word starting with one of them is treated as "no bucket" and left to the
+normal pipeline.
 
 ## The language modules are one code base
 
@@ -701,9 +749,8 @@ plus oracle-confirmed Spanish outputs.
 
 ## Not started
 
-The user dictionary, the inline-command parser, Spanish's duration rules and
-generator relocation, and the `TIBASE32` public API beyond its declared
-surface.
+The inline-command parser, Spanish's duration rules and generator
+relocation, and the `TIBASE32` public API beyond its declared surface.
 
 | Stage | Status |
 |---|---|

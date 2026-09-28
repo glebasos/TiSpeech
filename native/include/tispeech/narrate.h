@@ -110,12 +110,42 @@ static inline uint32_t sv_rec_class(const sv_record *r)
 /* ------------------------------------------------------------------------ */
 /* TIBASE32 tables the pipeline reads.                                       */
 /* ------------------------------------------------------------------------ */
+/* Inline-command keyword table, 0x1c0126b0: 59 entries of {name, code},
+ * 6 bytes each (a 4-byte name pointer then a uint16 code). Matched in table
+ * order by case-sensitive PREFIX (strncmp(word, name, strlen(name))) — first
+ * match wins, which is why single-letter entries like "p" sit after every
+ * longer word starting with 'p'. See FUN_1c005180/1c005310 in narrate.c. */
+#define SV_CMD_KEYWORD_COUNT 59
+typedef struct sv_cmd_keyword {
+    const char *name;
+    uint16_t code;
+} sv_cmd_keyword;
+
 typedef struct sv_nar_tables {
     /* 0x1c012a68: 60 pointers, by (char - 0x20), to lists of
      * (second char, code) byte pairs. Resolved to host pointers. */
     const uint8_t *phoneme_names[60];
     /* 0x1c013600: the 20-row voice table, 74 bytes per row. */
     const uint8_t *voices;
+
+    /* -- Inline-command parser tables (FUN_1c005180 and callees). -------- */
+    /* 0x1c0126b0, SV_CMD_KEYWORD_COUNT entries. */
+    sv_cmd_keyword cmd_keywords[SV_CMD_KEYWORD_COUNT];
+    /* 0x1c012b58: semitone offsets for note letters a..g (0x1c005393). */
+    int16_t cmd_notes[7];
+    /* Value-list commands: array of name pointers, matched the same way as
+     * the keyword table (case-sensitive prefix, first match wins), via
+     * FUN_1c0057e0. Sizes are fixed by the original's own hardcoded table
+     * bounds (see extract_base.py-style shape checks in sv_nar_tables_init). */
+    const char *cmd_language[3];  /* 0x1c012918: english, spanish, german   */
+    const char *cmd_voice[20];    /* 0x1c012830: the 20 named voices        */
+    const char *cmd_tract[4];     /* 0x1c012888: male, female, child, giant */
+    const char *cmd_glot[9];      /* 0x1c0128a0: glottal-source choice      */
+    const char *cmd_voicing[3];   /* 0x1c0128c8: normal, breathy, whispered */
+    const char *cmd_f0style[5];   /* 0x1c0128d8: natural, style2, monotone,
+                                    * sing, random                          */
+    const char *cmd_speak[4];     /* 0x1c0128f0: natural, word, spell, none */
+    const char *cmd_onoff[2];     /* 0x1c012908: off, on                    */
 } sv_nar_tables;
 
 /* ------------------------------------------------------------------------ */
@@ -133,6 +163,13 @@ typedef struct sv_engine {
     /* The voice block, handle+0xd0: 0x4a bytes of words, indexed here by
      * byte offset / 2. Filled from a voice-table row by 0x1c00e120. */
     uint16_t voice[0x25];
+
+    /* handle+0xcc: persists across calls, unlike the per-call `flags`
+     * argument to sv_narrate_begin. The only bit any reconstructed code ever
+     * sets is 0x10 (speaking mode, sv_engine_set_speaking_mode below); it
+     * starts zero, matching a freshly opened handle. 0x1c00df20 folds this
+     * into e->flags at the start of every sentence — see sv_narrate_begin. */
+    uint32_t handle_flags;
 
     const char *text;             /* +0x08 current sentence       */
     uint16_t record_capacity;     /* +0x0c                        */
@@ -270,8 +307,18 @@ int32_t sv_tts_phonemes(const sv_langmod *m, const char *text, uint32_t flags,
 /* 0x1c00e120: load voice-table row `row` into the voice block. */
 void sv_voice_load(sv_engine *e, const uint8_t *voices, unsigned row);
 
+/* 0x1c00ecd0, _SVSetSpeakingMode@8: sets or clears handle_flags bit 0x10
+ * (persists until the next call). `value & 7` must be nonzero (matching the
+ * original's own validation) or this returns SV_TP_E_BADARG without touching
+ * the flag; bit 0x2 of value then selects set (1) or clear (0). Reused here
+ * rather than a dedicated error code because the original returns the same
+ * 0x1b62 SVTextToPhon uses for a bad argument. */
+int sv_engine_set_speaking_mode(sv_engine *e, uint32_t value);
+
 /* 0x1c00df20 (the part that reaches the generation pipeline): copy the voice
- * block into the engine fields. `text` is the phoneme string. */
+ * block into the engine fields. `text` is the phoneme string. Folds
+ * e->handle_flags (persistent) and `flags` (this call only) into e->flags,
+ * exactly as _SVNarrate@20's 0x1c003833..0x1c003854 preamble does. */
 void sv_narrate_begin(sv_engine *e, const char *text, uint32_t flags);
 
 /* 0x1c00c500. Returns nonzero while there is another sentence. */

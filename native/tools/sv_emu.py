@@ -298,9 +298,41 @@ class Emu:
         if p: self.w32(p, 0x32a9a200)
         return 0x32a9a200
     def api_localtime(self): return self.tm_buf
-    def api_fopen(self): return 0
-    def api_fclose(self): return 0
-    def api_fread(self): return 0
+
+    # ---- virtual files (opt-in; used to exercise SVLoadUserDictionary, which
+    # reads through fopen/fread/fclose rather than a Win32 file API) ----
+    def register_file(self, path, data):
+        """Make fopen(path, ...) succeed and fread() serve `data`."""
+        if not hasattr(self, "_vfiles"):
+            self._vfiles, self._open_files, self._next_fh = {}, {}, 1
+        self._vfiles[path] = bytes(data)
+
+    def api_fopen(self):
+        path = self.cstr(self.arg(0)).decode("latin-1")
+        vfiles = getattr(self, "_vfiles", {})
+        if path not in vfiles:
+            return 0
+        fh = self._next_fh
+        self._next_fh += 1
+        self._open_files[fh] = {"data": vfiles[path], "pos": 0}
+        return fh
+
+    def api_fclose(self):
+        stream = self.arg(0)
+        return 0 if getattr(self, "_open_files", {}).pop(stream, None) is not None else -1 & 0xffffffff
+
+    def api_fread(self):
+        buf, size, count, stream = self.arg(0), self.arg(1), self.arg(2), self.arg(3)
+        f = getattr(self, "_open_files", {}).get(stream)
+        if not f or size == 0:
+            return 0
+        n = size * count
+        chunk = f["data"][f["pos"]:f["pos"] + n]
+        chunk = chunk[:len(chunk) - (len(chunk) % size)]
+        if chunk:
+            self.mu.mem_write(buf, chunk)
+            f["pos"] += len(chunk)
+        return len(chunk) // size
 
     # ---- KERNEL32 ----
     def api_GetVersion(self): return 0x0a280105  # NT-like: high bit clear

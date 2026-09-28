@@ -12,7 +12,7 @@ internal interface INativePcmSynthesizer
     TiEngineCapabilities Capabilities { get; }
     TiLanguageFlags Languages { get; }
     string? UnavailableReason { get; }
-    TiSynthesisResult Render(TiLanguage language, string text, TiVoiceOptions options);
+    TiSynthesisResult Render(TiLanguage language, string text, TiVoiceOptions options, TiUserDictionary? dictionary);
 }
 
 internal sealed class NativePcmSynthesizer : INativePcmSynthesizer
@@ -23,8 +23,8 @@ internal sealed class NativePcmSynthesizer : INativePcmSynthesizer
         : !Capabilities.HasFlag(TiEngineCapabilities.Synthesis)
             ? "English synthesis data is unavailable (TISPEECH_E_NOTIMPL). Rebuild with TIBASE32.DLL and TIENG32.DLL."
             : null;
-    public TiSynthesisResult Render(TiLanguage language, string text, TiVoiceOptions options) =>
-        TiSpeechNative.SynthesizeText(language, text, options);
+    public TiSynthesisResult Render(TiLanguage language, string text, TiVoiceOptions options, TiUserDictionary? dictionary) =>
+        TiSpeechNative.SynthesizeText(language, text, options, dictionary);
 }
 
 /// <summary>
@@ -44,6 +44,7 @@ public sealed class NativeTiSpeechBackend : ITiSpeechBackend, ITiPhonemeProvider
     private bool _open, _disposed, _paused;
     private CancellationTokenSource? _active;
     private string? _openError;
+    private TiUserDictionary? _dictionary;
 
     public NativeTiSpeechBackend() : this(new SystemPcmPlayer()) { }
     public NativeTiSpeechBackend(IPcmPlayer player) : this(player, new NativePcmSynthesizer()) { }
@@ -74,8 +75,49 @@ public sealed class NativeTiSpeechBackend : ITiSpeechBackend, ITiPhonemeProvider
             ? "The native library was built without language data. Rebuild with TIENG32.DLL or TISPAN32.DLL."
             : null;
     string? ITiPhonemeProvider.UnavailableDetail => TiSpeechNative.UnavailableDetail;
-    public TiPhonemeResult TextToPhonemes(TiLanguage language, string text) =>
-        TiSpeechNative.TextToPhonemes(language, text);
+    public TiPhonemeResult TextToPhonemes(TiLanguage language, string text)
+    {
+        TiUserDictionary? dictionary;
+        lock (_sync) dictionary = _dictionary;
+        return TiSpeechNative.TextToPhonemes(language, text, dictionary);
+    }
+
+    /// <summary>The loaded user dictionary, or null.</summary>
+    public TiUserDictionary? UserDictionary { get { lock (_sync) return _dictionary; } }
+
+    /// <summary>
+    /// SVLoadUserDictionary: one dictionary per engine, replacing any loaded
+    /// one. Applies to phoneme previews and speech started afterwards.
+    /// </summary>
+    /// <exception cref="InvalidDataException">The file is not a valid user dictionary.</exception>
+    public void LoadUserDictionary(string path)
+    {
+        var loaded = TiUserDictionary.Load(path);
+        TiUserDictionary? previous;
+        lock (_sync)
+        {
+            if (_disposed)
+            {
+                loaded.Dispose();
+                throw new ObjectDisposedException(nameof(NativeTiSpeechBackend));
+            }
+            previous = _dictionary;
+            _dictionary = loaded;
+        }
+        previous?.Dispose();
+    }
+
+    /// <summary>SVUnloadUserDictionary. A no-op when none is loaded.</summary>
+    public void UnloadUserDictionary()
+    {
+        TiUserDictionary? previous;
+        lock (_sync)
+        {
+            previous = _dictionary;
+            _dictionary = null;
+        }
+        previous?.Dispose();
+    }
 
     public bool Open(TiLanguageFlags languages = TiLanguageFlags.English)
     {
@@ -100,11 +142,13 @@ public sealed class NativeTiSpeechBackend : ITiSpeechBackend, ITiPhonemeProvider
     {
         TiVoiceOptions voice;
         TiLanguage language;
+        TiUserDictionary? dictionary;
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             voice = _voice;
             language = _language;
+            dictionary = _dictionary;
             if (_speakingMode != TiSpeakingMode.Natural)
                 return Task.FromResult(TiSynthesisResult.Failure(TiStatus.NotImplemented,
                     "Native speech currently supports the natural speaking mode only."));
@@ -112,7 +156,7 @@ public sealed class NativeTiSpeechBackend : ITiSpeechBackend, ITiPhonemeProvider
         return Task.Run(() =>
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var result = _synthesizer.Render(language, text, voice);
+            var result = _synthesizer.Render(language, text, voice, dictionary);
             cancellationToken.ThrowIfCancellationRequested();
             return result;
         }, cancellationToken);
@@ -222,6 +266,8 @@ public sealed class NativeTiSpeechBackend : ITiSpeechBackend, ITiPhonemeProvider
             _disposed = true;
             Close();
             _player.Dispose();
+            _dictionary?.Dispose();
+            _dictionary = null;
         }
     }
 }

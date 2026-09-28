@@ -48,13 +48,28 @@ void sv_voice_load(sv_engine *e, const uint8_t *voices, unsigned row)
 #undef VB
 }
 
+/* 0x1c00ecd0. */
+int sv_engine_set_speaking_mode(sv_engine *e, uint32_t value)
+{
+    if (!(value & 7))
+        return SV_TP_E_BADARG;
+    if (value & 2)
+        e->handle_flags |= 0x10;
+    else
+        e->handle_flags &= ~0x10u;
+    return 0;
+}
+
 /* 0x1c00df20, plus the flag handling _SVNarrate@20 does around it
- * (0x1c003830..0x1c003854). */
+ * (0x1c003830..0x1c003854). 0x1c00df33 copies handle+0xcc (e->handle_flags
+ * here) into state+0x4e verbatim; the preamble then ORs in the per-call
+ * `flags` argument and the two hardcoded bits. Folded into one assignment
+ * since nothing ever reads the intermediate value. */
 void sv_narrate_begin(sv_engine *e, const char *text, uint32_t flags)
 {
     const uint16_t *v = e->voice;
 #define VW(off) (v[(off) / 2])
-    e->flags = flags | 0x80000000u;
+    e->flags = e->handle_flags | flags | 0x80000000u;
     if (!(e->flags & 0x40000000u))
         e->flags |= 0x20000000u;
     e->text = text;
@@ -160,6 +175,261 @@ static int16_t parse_number(const char *s)
 }
 
 /* ------------------------------------------------------------------------ */
+/* 0x1c005180 — inline `{...}` command parser                                */
+/*                                                                           */
+/* Syntax: `{word}`, `{word arg}` or `{word arg extra}`; several commands in  */
+/* one pair of braces are separated by `;`, and several pairs of braces in a  */
+/* row chain automatically (optional spaces between `}` and the next `{`).    */
+/* Each `word` emits one 3-word command into e->commands. A `word` is one of: */
+/*                                                                           */
+/*   - a decimal number (parse_number's syntax): command 0x28, value = the   */
+/*     number, extra always 0, and (an original quirk kept as-is) the value  */
+/*     is never checked against the malformed-number sentinel (0x1c005337).  */
+/*   - a musical note, `[a-g]['#']digit`: command 0xb4, value =              */
+/*     -(semitone_offset[letter] + octave*12 + sharp), extra = a second,     */
+/*     space-separated word parsed as a number (0 if absent). `digit` must   */
+/*     be 0..8 or this is not a note after all and falls through to the      */
+/*     keyword table below (0x1c005381).                                    */
+/*   - `p` directly followed by a digit, e.g. "p5": shorthand for "pitch 5"  */
+/*     with no space -- the digits splice in as the keyword's own argument   */
+/*     word (0x1c005404).                                                   */
+/*   - one of SV_CMD_KEYWORD_COUNT named keywords (base->cmd_keywords, in    */
+/*     table order, matched by case-sensitive PREFIX -- so shorter names     */
+/*     must sit after every longer name sharing the same prefix, which is    */
+/*     why "p" is entry 44 rather than entry 0). Most take a plain number as */
+/*     their argument (0x1c00564e); eight of them (language, voice, tract,   */
+/*     glot, voicing, f0style, speak, mouths, sentsync, syllsync, phonsync,  */
+/*     allsyncs) instead match a NAMED argument against a per-command list    */
+/*     (0x1c005480..0x1c005649). The other two `*sync` commands (wordsync,   */
+/*     usync) take a plain number like everything else -- which four of the  */
+/*     six get the named list is a fixed dispatch-table lookup in the        */
+/*     original (0x1c0056a4, embedded in .text next to FUN_1c005180's own    */
+/*     code, so not extracted as data); hardcoded here as four more cases,   */
+/*     the same as every other fixed command code below.                    */
+/*                                                                           */
+/* Every word (number, note, or keyword) may be followed by a further,       */
+/* space-separated word that becomes the command's `extra` field, always a   */
+/* number (0 if absent). A word that fails to parse -- an unmatched keyword, */
+/* an out-of-range value, or a value/extra of exactly -32768 (the same bit   */
+/* pattern the parser uses as its own "malformed" sentinel, an ambiguity in  */
+/* the original kept as-is) fails the WHOLE `{...}` run with SV_NAR_E_COMMAND; */
+/* nothing after the last successfully-parsed word is written.               */
+/* ------------------------------------------------------------------------ */
+
+static uint16_t cmd_value(const char *s) /* FUN_1c0056e0: NULL is an error */
+{
+    return s ? (uint16_t)parse_number(s) : (uint16_t)0x8000;
+}
+
+static uint16_t cmd_extra(const char *s) /* FUN_1c005700: NULL means "0" */
+{
+    return s ? (uint16_t)parse_number(s) : 0;
+}
+
+/* 0x1c005230: up to three space-separated words starting at `p`, each ending
+ * at a space, ';', '}' or NUL; hitting one of the latter three where a word
+ * would otherwise start leaves it (and every word after it) NULL. Never
+ * advances `p` -- each command's words are (re-)scanned from its own start. */
+static void cmd_tokenize(const char *p, const char **w1, const char **w2,
+                         const char **w3)
+{
+    const char **slot[3] = { w1, w2, w3 };
+    *w1 = *w2 = *w3 = NULL;
+    if (!p)
+        return;
+    for (int k = 0; k < 3; k++) {
+        char c;
+        for (;;) {
+            c = *p++;
+            if (!c || c == ';' || c == '}')
+                return;
+            if (c != ' ') {
+                p--;
+                break;
+            }
+        }
+        *slot[k] = p;
+        for (;;) {
+            c = *p++;
+            if (!c || c == ';' || c == '}')
+                return;
+            if (c == ' ')
+                break;
+        }
+    }
+}
+
+/* 0x1c0052d0: given the start of a just-processed command, find the start of
+ * the next one -- right after a ';' (another command in the SAME braces), or
+ * right after a '{' that (modulo spaces) immediately follows a '}' (a
+ * chained "{...}{...}" pair). Returns NULL when the whole run ends: NUL
+ * reached with no ';' or '}' seen, or a '}' not followed by another '{'. */
+static const char *cmd_advance(const char *p)
+{
+    if (!p)
+        return NULL;
+    for (;;) {
+        char c = *p++;
+        if (!c)
+            return NULL;
+        if (c == ';')
+            return p;
+        if (c == '}')
+            break;
+    }
+    for (;;) {
+        char c = *p++;
+        if (!c)
+            return NULL;
+        if (c != ' ')
+            return c == '{' ? p : NULL;
+    }
+}
+
+/* 0x1c0057e0: the index of the first entry of `list` (length `n`) that is a
+ * case-sensitive prefix of `token`; 0x8000 if `token` is NULL or nothing
+ * matches. */
+static uint16_t cmd_match(const char *token, const char *const *list, int n)
+{
+    if (!token)
+        return 0x8000;
+    for (int i = 0; i < n; i++) {
+        size_t len = strlen(list[i]);
+        if (strncmp(token, list[i], len) == 0)
+            return (uint16_t)i;
+    }
+    return 0x8000;
+}
+
+/* 0x1c005310: interpret one word (plus its up-to-two following words) into a
+ * 3-word command. Returns 0 on success (out[] filled), nonzero if malformed. */
+static int cmd_one(const sv_engine *e, const char *w1, const char *w2,
+                   const char *w3, int16_t out[3])
+{
+    const sv_nar_tables *t = e->base;
+
+    if (!w1)
+        return -1;
+
+    if (w1[0] >= '0' && w1[0] <= '9') {
+        /* 0x1c005337 */
+        out[0] = 0x28;
+        out[1] = (int16_t)cmd_value(w1);
+        out[2] = 0;
+        return 0;
+    }
+
+    if (w1[0] >= 'a' && w1[0] <= 'g') {
+        /* 0x1c005381: a musical note, letter['#']octave. */
+        int letter = w1[0] - 'a';
+        int sharp = (w1[1] == '#') ? 1 : 0;
+        int16_t octave = (int16_t)cmd_value(w1 + 1 + sharp);
+        if (octave >= 0 && octave <= 8) {
+            out[0] = 0xb4;
+            out[1] = (int16_t)-(t->cmd_notes[letter] + octave * 12 + sharp);
+            out[2] = (int16_t)cmd_extra(w2);
+            return (uint16_t)out[2] == 0x8000 ? -1 : 0;
+        }
+        /* out of range: not a note after all -- fall through to the keyword
+         * table, exactly as the original does (0x1c0053b0/1c0053b6). */
+    }
+
+    if (w1[0] == 'p' && w1[1] >= '0' && w1[1] <= '9') {
+        /* 0x1c005404: "p5" == "pitch 5" with no space. */
+        w3 = w2;
+        w2 = w1 + 1;
+    }
+
+    for (int i = 0; i < SV_CMD_KEYWORD_COUNT; i++) {
+        const char *name = t->cmd_keywords[i].name;
+        size_t len = strlen(name);
+        if (strncmp(w1, name, len) != 0)
+            continue;
+        uint16_t code = t->cmd_keywords[i].code;
+        uint16_t value;
+        out[0] = (int16_t)code;
+        switch (code) {
+        case 0x41:  value = cmd_match(w2, t->cmd_language, 3);  break;
+        case 0x32:  value = cmd_match(w2, t->cmd_voice, 20);    break;
+        case 0xc8:  value = cmd_match(w2, t->cmd_tract, 4);     break;
+        case 0xd2:  value = cmd_match(w2, t->cmd_glot, 9);      break;
+        case 0xdc:  value = cmd_match(w2, t->cmd_voicing, 3);   break;
+        case 0xf0:  value = cmd_match(w2, t->cmd_f0style, 5);   break;
+        case 0x212: value = cmd_match(w2, t->cmd_speak, 4);     break;
+        case 0x320: /* mouths   */
+        case 0x32a: /* sentsync */
+        case 0x33e: /* syllsync */
+        case 0x348: /* phonsync */
+        case 0x35c: /* allsyncs */
+            value = cmd_match(w2, t->cmd_onoff, 2);
+            break;
+        default: /* including wordsync (0x334) and usync (0x352) */
+            value = cmd_value(w2);
+            break;
+        }
+        out[1] = (int16_t)value;
+        out[2] = (int16_t)cmd_extra(w3);
+        return (value == 0x8000 || (uint16_t)out[2] == 0x8000) ? -1 : 0;
+    }
+    return -1; /* no keyword matched */
+}
+
+/* 0x1c005180: parse one or more `{...}` groups, `cur` already pointing right
+ * after the FIRST '{' (its content), writing 3-word commands from `cmd`
+ * onward. On success returns the advanced command pointer and sets
+ * `*cur_out`/`*c_out` the way the main loop's own `c = *cur++` would, one
+ * past the run (the caller still owns updating `remaining` -- the exact
+ * count consumed is `*cur_out - cur`, matching what the original tracks by
+ * hand). On failure returns NULL, leaves `*cur_out` at the start of the
+ * offending word and does not touch `*c_out`. */
+static int16_t *parse_inline_commands(const sv_engine *e, const char *cur,
+                                      const char **cur_out, char *c_out,
+                                      int16_t *cmd)
+{
+    const char *group = cur;
+    if (!cur)
+        return NULL;
+    for (;;) {
+        const char *w1, *w2, *w3;
+        int16_t out[3];
+        cmd_tokenize(group, &w1, &w2, &w3);
+        if (cmd_one(e, w1, w2, w3, out)) {
+            *cur_out = group;
+            return NULL;
+        }
+        /* ours: parse()'s pool-sizing loop (0x1c004a1b..0x1c004a97, already
+         * ported unchanged) reserves one slot per ';' and two per '}', which
+         * covers one slot per command here plus a final SV_CMD_END -- this
+         * cannot actually trip, but the file's convention is to guard the
+         * write rather than trust the arithmetic silently. */
+        if ((size_t)(cmd - e->commands) + 3 > 3 * e->command_capacity) {
+            *cur_out = group;
+            return NULL;
+        }
+        cmd[0] = out[0];
+        cmd[1] = out[1];
+        cmd[2] = out[2];
+        cmd += 3;
+        const char *next = cmd_advance(group);
+        if (!next)
+            break;
+        group = next;
+    }
+    /* 0x1c0051f7..0x1c005219: scan from the last group's start to (and past)
+     * the closing '}', then fetch the next character exactly like the main
+     * loop's `c = *cur++` -- including its unconditional advance past a NUL
+     * reached without ever finding '}', which the original does too. */
+    const char *p = group;
+    while (*p && *p != '}')
+        p++;
+    if (*p == '}')
+        p++;
+    *c_out = *p;
+    *cur_out = p + 1;
+    return cmd;
+}
+
+/* ------------------------------------------------------------------------ */
 /* 0x1c004a10 — the phoneme-string parser                                    */
 /* ------------------------------------------------------------------------ */
 
@@ -255,10 +525,25 @@ static int parse(sv_engine *e)
                 c = *cur++;
                 continue;
             }
-            /* 0x1c004c4d: FUN_1c005180 parses the braces into commands.
-             * Not reconstructed yet. */
-            (void)pending;
-            return SV_NAR_E_NOTIMPL;
+            /* 0x1c004c4d: FUN_1c005180 parses the braces into commands. */
+            if (!pending)
+                pending = cmd;
+            {
+                const char *entry = cur;
+                const char *new_cur;
+                char new_c;
+                int16_t *new_cmd = parse_inline_commands(e, cur, &new_cur, &new_c, cmd);
+                if (!new_cmd) {
+                    result = SV_NAR_E_COMMAND;
+                    remaining = 0;
+                    break;
+                }
+                remaining -= (int32_t)(new_cur - entry);
+                cmd = new_cmd;
+                cur = new_cur;
+                c = new_c;
+            }
+            continue;
         }
 
         /* 0x1c004c85: phoneme name lookup. */
@@ -945,6 +1230,19 @@ static uint16_t final_code(const sv_engine *e)
 
 static void classify_caf0(sv_engine *e)
 {
+    /* ours: a sentence with no stressed group at all (e->groups == 0 --
+     * reachable once inline commands can produce a sentence with no real
+     * phonetic content, e.g. "{voice male}" alone) makes the original
+     * compute this and classify_cb60's `groups - 1` as a 32-bit index of
+     * -1. On the original's 32-bit target that wraps back to "one byte
+     * before the array", landing harmlessly inside the same padded
+     * allocation; the identical C expression on a 64-bit host adds a
+     * ~4-billion-byte offset instead, which is not the same computation
+     * and is not safely reproducible, so it is refused here rather than
+     * chased into whatever it would hit. Nothing downstream reads the
+     * intonation arrays when there is no stressed group to describe. */
+    if (e->groups == 0)
+        return;
     uint16_t ax = final_code(e);
     uint8_t cl = 0;
     if (ax == 1)
@@ -968,6 +1266,11 @@ static void classify_caf0(sv_engine *e)
 
 static void classify_cb60(sv_engine *e)
 {
+    /* ours: see classify_caf0 -- e->groups == 0 makes `e->into_e0[g - 1]`
+     * below a 64-bit out-of-bounds index rather than the original's
+     * harmless 32-bit wraparound. */
+    if (e->groups == 0)
+        return;
     unsigned g = e->groups;
     uint8_t *pdc = e->into_dc, *pd8 = e->into_d8, *mark = NULL;
     uint8_t dl = (uint8_t)(e->into_e0[g - 1] & 0xc);

@@ -52,6 +52,12 @@ public enum TiStatus
     /// <summary>TISPEECH_E_NULLTEXT — null text pointer.</summary>
     NullText = 0x1b70,
 
+    /// <summary>TISPEECH_E_DICTSHORT — the user dictionary file is truncated.</summary>
+    DictionaryTruncated = 0x1b6b,
+
+    /// <summary>TISPEECH_E_DICTFORMAT — not a SoftVoice ("SVXF") user dictionary.</summary>
+    DictionaryFormat = 0x1b6c,
+
     /// <summary>
     /// TISPEECH_E_NOTIMPL — the requested pipeline stage is not reconstructed.
     /// This is a real, expected answer, not an error to paper over.
@@ -85,6 +91,8 @@ public static class TiStatusExtensions
         TiStatus.BadParam              => "Invalid argument (TISPEECH_E_BADPARAM).",
         TiStatus.NoLanguage            => "No letter-to-sound data for that language in this build (TISPEECH_E_NOLANGUAGE).",
         TiStatus.NullText              => "Null text (TISPEECH_E_NULLTEXT).",
+        TiStatus.DictionaryTruncated   => "The user dictionary file is truncated (TISPEECH_E_DICTSHORT).",
+        TiStatus.DictionaryFormat      => "Not a SoftVoice user dictionary (TISPEECH_E_DICTFORMAT).",
         TiStatus.NotImplemented        => "Not implemented in the native reconstruction yet (TISPEECH_E_NOTIMPL).",
         TiStatus.BufferFull            => "Output buffer too small (TISPEECH_E_BUFFERFULL).",
         TiStatus.LibraryUnavailable    => "The TiSpeech native library is not loaded.",

@@ -14,12 +14,14 @@ With both `TIENG32.DLL` and `TIBASE32.DLL` supplied at build time,
 `TiSpeechNative.Synthesize` returns original-voice 8-bit mono PCM at 11025 Hz.
 The complete text-to-audio path has been compared sample for sample with the
 original engine. The `svsay -t "hello world" out.wav` native tool converts plain
-text directly to a WAV file. Inline synthesis commands and user dictionaries
-remain unsupported.
+text directly to a WAV file. SoftVoice user dictionaries (`SVXF` files) are
+supported for English via `TiUserDictionary` and
+`NativeTiSpeechBackend.LoadUserDictionary`. Inline synthesis commands remain
+unsupported.
 
-**Application playback is not wired up yet.** `NativeTiSpeechBackend.Open`
-still returns false and Talk/Export remain disabled; library callers and
-`svsay` can already generate audio. CMake uses `TISPEECH_ENG_DLL`,
+`NativeTiSpeechBackend` plays synthesized speech through the system player
+(`afplay` on macOS, `paplay`/`aplay` on Linux), so OpenTalkIt's Talk and Export
+work without the Windows host. CMake uses `TISPEECH_ENG_DLL`,
 `TISPEECH_SPAN_DLL`, and `TISPEECH_BASE_DLL`; MSBuild accepts `TiSpeechEngDll`,
 `TiSpeechSpanDll`, and `TiSpeechBaseDll` and detects copies in OpenTalkIt/DLLs.
 

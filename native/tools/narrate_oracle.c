@@ -58,6 +58,14 @@ int oracle_begin(sv_engine *e, const char *phon, uint32_t flags)
     return 0;
 }
 
+/* 0x1c00ecd0, _SVSetSpeakingMode@8: e->handle_flags persists across
+ * oracle_begin/oracle_sentence calls, matching handle+0xcc in the original.
+ * Call this before oracle_begin so sv_narrate_begin folds it into e->flags. */
+int oracle_set_speaking_mode(sv_engine *e, uint32_t value)
+{
+    return sv_engine_set_speaking_mode(e, value);
+}
+
 int oracle_sentence(sv_engine *e, uint32_t stop_after)
 {
     return sv_narrate_sentence(e, stop_after);

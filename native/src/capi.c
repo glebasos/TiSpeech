@@ -11,6 +11,7 @@
 #include "tispeech/capi.h"
 #include "tispeech/narrate.h"
 #include "tispeech/ruleset.h"
+#include "tispeech/userdict.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -137,7 +138,8 @@ extern const uint32_t sv_eng_image_desc[10];
 extern const sv_image sv_eng_image_text[];
 extern const size_t sv_eng_image_text_count;
 
-static int32_t text_to_phonemes_eng(const char *text, char *out, int32_t size)
+static int32_t text_to_phonemes_eng(const char *text, const sv_userdict_t *dict,
+                                     char *out, int32_t size)
 {
     /* SVTextToPhon silently emits nothing above 0x202 input bytes. Expose
      * an explicit limit rather than reporting a successful empty conversion. */
@@ -150,7 +152,7 @@ static int32_t text_to_phonemes_eng(const char *text, char *out, int32_t size)
         return TISPEECH_E_NOLANGUAGE;
     if (sv_langgen_attach(&eng, &li, sv_eng_image_text, sv_eng_image_text_count))
         return TISPEECH_E_OUTOFMEMORY;
-    int32_t rc = sv_tts_phonemes(&eng, text, 0, &phonemes);
+    int32_t rc = sv_tts_phonemes_ex(&eng, text, 0, dict, &phonemes);
     sv_langgen_detach(&eng);
     if (rc == 0) {
         size_t n = strlen(phonemes);
@@ -164,8 +166,40 @@ static int32_t text_to_phonemes_eng(const char *text, char *out, int32_t size)
 }
 #endif
 
+int32_t tispeech_userdict_load(const uint8_t *bytes, int32_t size,
+                               tispeech_userdict **out_dict)
+{
+    sv_userdict_t *dict = NULL;
+    if (out_dict == NULL)
+        return TISPEECH_E_BADPARAM;
+    *out_dict = NULL;
+    if (bytes == NULL || size < 0)
+        return TISPEECH_E_BADPARAM;
+    switch (sv_userdict_parse(bytes, (size_t)size, &dict)) {
+    case SV_USERDICT_OK:
+        *out_dict = (tispeech_userdict *)dict;
+        return TISPEECH_OK;
+    case SV_USERDICT_E_SHORT: return TISPEECH_E_DICTSHORT;
+    case SV_USERDICT_E_MAGIC: return TISPEECH_E_DICTFORMAT;
+    case SV_USERDICT_E_NOMEM: return TISPEECH_E_OUTOFMEMORY;
+    default: return TISPEECH_E_BADPARAM;
+    }
+}
+
+void tispeech_userdict_free(tispeech_userdict *dict)
+{
+    sv_userdict_free((sv_userdict_t *)dict);
+}
+
 int32_t tispeech_text_to_phonemes(uint32_t language, const char *text,
                                   char *out, int32_t out_size)
+{
+    return tispeech_text_to_phonemes_ex(language, text, NULL, out, out_size);
+}
+
+int32_t tispeech_text_to_phonemes_ex(uint32_t language, const char *text,
+                                     const tispeech_userdict *dict,
+                                     char *out, int32_t out_size)
 {
     const sv_ruleset_t *rules;
     char *work;
@@ -182,6 +216,14 @@ int32_t tispeech_text_to_phonemes(uint32_t language, const char *text,
     rules = ruleset_for(language);
     if (rules == NULL)
         return TISPEECH_E_NOLANGUAGE;
+    /* The dictionary lookup lives in the reconstructed English front end;
+     * the matcher-only path has nowhere to consult it. */
+    if (dict != NULL) {
+#ifdef TISPEECH_HAVE_ENG
+        if (language != TISPEECH_LANG_ENGLISH)
+#endif
+            return TISPEECH_E_NOTIMPL;
+    }
 
     status = normalise(text, &work, language == TISPEECH_LANG_ENGLISH);
     if (status != TISPEECH_OK)
@@ -189,7 +231,8 @@ int32_t tispeech_text_to_phonemes(uint32_t language, const char *text,
 
 #ifdef TISPEECH_HAVE_ENG
     if (language == TISPEECH_LANG_ENGLISH) {
-        status = text_to_phonemes_eng(work, out, out_size);
+        status = text_to_phonemes_eng(work, (const sv_userdict_t *)dict,
+                                      out, out_size);
         free(work);
         return status;
     }

@@ -30,13 +30,18 @@
  * The C runtime calls the original makes (_isctype, toupper, strspn, ...) run
  * in the "C" locale there; ct() below is that locale's _pctype table.
  *
- * Not reconstructed: the user dictionary (0x1c2097a0 is a no-op until
- * SVLoadUserDictionary is), which is also what the original does when none
- * is loaded.
+ * The user dictionary (TIENG32 0x1c2097a0, TIBASE32's _SVLoadUserDictionary@8
+ * / _SVUnloadUserDictionary@8) is reconstructed in userdict.c / userdict.h;
+ * sv_text_to_phon_ex() below takes an optional dictionary and lang_word()
+ * consults it at the same point the original does, before the built-in
+ * exception dictionary. sv_text_to_phon() is unchanged — it is
+ * sv_text_to_phon_ex(..., NULL) — so behaviour without a dictionary stays
+ * byte-identical.
  */
 
 #include "langmod_priv.h"
 #include "tispeech/ruleset.h"
+#include "tispeech/userdict.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +64,7 @@ typedef struct {
     uint16_t cls[256];                  /* 0x1c209c20, the rule class table */
     const unsigned char *buckets[256];  /* 0x1c24c744, resolved */
     sv_ruleset_t rules;
+    const sv_userdict_t *dict;          /* optional; NULL = none loaded */
     /* FUN_1c208150's token pointers, 0x1c250120..0x1c250128. */
     char *tok;   /* 0x1c250128 */
     char *next;  /* 0x1c25011c: the token's end, then the next word */
@@ -1092,7 +1098,18 @@ static int lang_word(fe_t *fe)
     }
     for (;;) {
         c->status &= ~4u;
-        /* 0x1c2097a0, the user dictionary: none is loaded. */
+        /* 0x1c2097a0, the user dictionary (userdict.c). Consulted first, and
+         * only when one is loaded — with fe->dict NULL this is a no-op, so
+         * behaviour is unchanged from before this hook existed. */
+        if (fe->dict) {
+            const char *in = c->in;
+            int rc = sv_userdict_lookup(fe->dict, fe->cls, c->src, &in,
+                                        &c->out, &c->out_left, &c->status);
+            c->src += in - c->in;
+            c->in = (char *)in;
+            if (rc)
+                return 1;
+        }
         if (exceptions(fe))
             return 1;
         if (numbers(fe))
@@ -1216,8 +1233,9 @@ static int keep_latin1(unsigned char ch, unsigned char *to)
     }
 }
 
-int32_t sv_text_to_phon(const sv_langmod *m, const char *text, char *out,
-                        int32_t out_size, uint32_t flags)
+int32_t sv_text_to_phon_ex(const sv_langmod *m, const char *text, char *out,
+                           int32_t out_size, uint32_t flags,
+                           const sv_userdict_t *dict)
 {
     fe_t *fe;
     tp_ctx *c;
@@ -1244,6 +1262,7 @@ int32_t sv_text_to_phon(const sv_langmod *m, const char *text, char *out,
         free(block);
         return bad ? SV_NAR_E_NOTIMPL : SV_NAR_E_NOMEM;
     }
+    fe->dict = dict;
     buf = block + SLACK;
     c = &fe->c;
     c->src = text;
@@ -1342,8 +1361,21 @@ int32_t sv_text_to_phon(const sv_langmod *m, const char *text, char *out,
     return ret;
 }
 
+int32_t sv_text_to_phon(const sv_langmod *m, const char *text, char *out,
+                        int32_t out_size, uint32_t flags)
+{
+    return sv_text_to_phon_ex(m, text, out, out_size, flags, NULL);
+}
+
 int32_t sv_tts_phonemes(const sv_langmod *m, const char *text, uint32_t flags,
                         char **phonemes)
+{
+    return sv_tts_phonemes_ex(m, text, flags, NULL, phonemes);
+}
+
+int32_t sv_tts_phonemes_ex(const sv_langmod *m, const char *text,
+                           uint32_t flags, const sv_userdict_t *dict,
+                           char **phonemes)
 {
     /* _SVTTS@32 up to its SVNarrate call. The phoneme buffer starts at
      * (strlen + 10) * 3 bytes, or * 6 in spell mode. When SVTextToPhon fills
@@ -1379,7 +1411,7 @@ int32_t sv_tts_phonemes(const sv_langmod *m, const char *text, uint32_t flags,
             break;
         }
         chunks[nchunks++].p = b;
-        rc = sv_text_to_phon(m, text, b, size, flags);
+        rc = sv_text_to_phon_ex(m, text, b, size, flags, dict);
         if (rc == 0 || rc == SV_NAR_E_NOMEM || rc == SV_NAR_E_NOTIMPL
             || rc == SV_TP_E_BADARG)
             break;

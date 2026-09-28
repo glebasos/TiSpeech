@@ -88,6 +88,19 @@ public static partial class TiSpeechNative
     }
 
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    [LibraryImport(LibraryName, EntryPoint = "tispeech_userdict_load")]
+    internal static unsafe partial int NativeUserDictLoad(byte* bytes, int size, IntPtr* outDict);
+
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    [LibraryImport(LibraryName, EntryPoint = "tispeech_userdict_free")]
+    internal static partial void NativeUserDictFree(IntPtr dict);
+
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    [LibraryImport(LibraryName, EntryPoint = "tispeech_text_to_phonemes_ex")]
+    private static unsafe partial int NativeTextToPhonemesEx(uint language, byte* text, IntPtr dict,
+        byte* output, int outputSize);
+
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     [LibraryImport(LibraryName, EntryPoint = "tispeech_synthesize_ex")]
     private static unsafe partial int NativeSynthesizeEx(uint language, byte* phonemes,
         NativeVoiceOptions* options, byte** outSamples, int* outCount, int* outSampleRate);
@@ -347,10 +360,12 @@ public static partial class TiSpeechNative
     /// <summary>
     /// Text-to-phoneme conversion on macOS, Linux and Windows. English uses
     /// the reconstructed normaliser, exception dictionary and stress rules;
-    /// Spanish currently uses letter-to-sound rules only. User dictionaries
-    /// are not supported. English accepts at most 514 Latin-1 characters.
+    /// Spanish currently uses letter-to-sound rules only. A
+    /// <paramref name="dictionary"/> is consulted first, as SVTextToPhon does
+    /// (English only). English accepts at most 514 Latin-1 characters.
     /// </summary>
-    public static TiPhonemeResult TextToPhonemes(TiLanguage language, string text)
+    public static TiPhonemeResult TextToPhonemes(TiLanguage language, string text,
+        TiUserDictionary? dictionary = null)
     {
         ArgumentNullException.ThrowIfNull(text);
 
@@ -400,12 +415,33 @@ public static partial class TiSpeechNative
         {
             var output = new byte[size];
             int rc;
-            unsafe
+            if (dictionary is null)
             {
-                fixed (byte* pIn = input)
-                fixed (byte* pOut = output)
+                unsafe
                 {
-                    rc = NativeTextToPhonemes((uint)language, pIn, pOut, output.Length);
+                    fixed (byte* pIn = input)
+                    fixed (byte* pOut = output)
+                        rc = NativeTextToPhonemes((uint)language, pIn, pOut, output.Length);
+                }
+            }
+            else
+            {
+                try
+                {
+                    rc = dictionary.Use(dict =>
+                    {
+                        unsafe
+                        {
+                            fixed (byte* pIn = input)
+                            fixed (byte* pOut = output)
+                                return NativeTextToPhonemesEx((uint)language, pIn, dict, pOut, output.Length);
+                        }
+                    });
+                }
+                catch (EntryPointNotFoundException)
+                {
+                    return TiPhonemeResult.Failure(TiStatus.NotImplemented,
+                        "Rebuild the native library to enable user dictionaries.");
                 }
             }
 
@@ -513,12 +549,13 @@ public static partial class TiSpeechNative
         }
     }
     /// <summary>Convert ordinary English text and synthesize the resulting phonemes.</summary>
-    public static TiSynthesisResult SynthesizeText(TiLanguage language, string text, TiVoiceOptions? options = null)
+    public static TiSynthesisResult SynthesizeText(TiLanguage language, string text, TiVoiceOptions? options = null,
+        TiUserDictionary? dictionary = null)
     {
         if (language != TiLanguage.English)
             return TiSynthesisResult.Failure(TiStatus.NoLanguage,
                 "Native speech currently supports English. Spanish phoneme previews remain available.");
-        var phonemes = TextToPhonemes(language, text);
+        var phonemes = TextToPhonemes(language, text, dictionary);
         if (!phonemes.IsSuccess)
             return TiSynthesisResult.Failure(phonemes.Status, phonemes.Message);
         if (string.IsNullOrWhiteSpace(phonemes.Phonemes))

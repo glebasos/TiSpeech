@@ -38,6 +38,8 @@ extern "C" {
 #define TISPEECH_E_BADPARAM     0x1b62
 #define TISPEECH_E_NOLANGUAGE   0x1b6e
 #define TISPEECH_E_NULLTEXT     0x1b70
+#define TISPEECH_E_DICTSHORT    0x1b6b /* user dictionary truncated */
+#define TISPEECH_E_DICTFORMAT   0x1b6c /* not an "SVXF" user dictionary */
 #define TISPEECH_E_OUTOFMEMORY  0x1b5a
 #define TISPEECH_E_NOTIMPL      0xF001
 #define TISPEECH_E_BUFFERFULL   0xF002
@@ -76,13 +78,39 @@ TISPEECH_API const char *tispeech_build_info(void);
  * expansion, letter-to-sound and default-stress stages, retaining original
  * spacing. English input is limited to 514 decoded Latin-1 bytes; longer
  * input returns TISPEECH_E_BADPARAM instead of the original's silent empty
- * output. Spanish currently covers letter-to-sound rules only. User
- * dictionaries are not implemented. On failure, a valid output buffer is
+ * output. Spanish currently covers letter-to-sound rules only. For user
+ * dictionaries see tispeech_text_to_phonemes_ex(). On failure, a valid output buffer is
  * cleared; callers can grow it and retry TISPEECH_E_BUFFERFULL.
  */
 TISPEECH_API int32_t tispeech_text_to_phonemes(uint32_t language,
                                                const char *text,
                                                char *out, int32_t out_size);
+
+/*
+ * User dictionaries (SVLoadUserDictionary's "SVXF" files). `bytes` is the
+ * whole file, already read by the caller: the library does no file I/O.
+ * Returns TISPEECH_OK with `*out_dict` set, or TISPEECH_E_DICTSHORT /
+ * TISPEECH_E_DICTFORMAT (the original's 0x1b6b / 0x1b6c), TISPEECH_E_BADPARAM
+ * or TISPEECH_E_OUTOFMEMORY with `*out_dict` NULL. A dictionary is immutable
+ * once loaded and may be shared between threads. Free it with
+ * tispeech_userdict_free(); NULL is a no-op.
+ */
+typedef struct tispeech_userdict tispeech_userdict;
+
+TISPEECH_API int32_t tispeech_userdict_load(const uint8_t *bytes, int32_t size,
+                                            tispeech_userdict **out_dict);
+TISPEECH_API void tispeech_userdict_free(tispeech_userdict *dict);
+
+/*
+ * As tispeech_text_to_phonemes(), consulting `dict` (may be NULL) before the
+ * built-in exceptions, numbers and rules, exactly where the original does.
+ * English only for now: a dictionary with another language returns
+ * TISPEECH_E_NOTIMPL.
+ */
+TISPEECH_API int32_t tispeech_text_to_phonemes_ex(uint32_t language,
+                                                  const char *text,
+                                                  const tispeech_userdict *dict,
+                                                  char *out, int32_t out_size);
 
 /*
  * Phoneme-to-PCM synthesis: SVNarrate's pipeline, reconstructed. `phonemes`

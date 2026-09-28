@@ -122,6 +122,50 @@ int main(void)
         CHECK(output[0] == '\0');
     }
     CHECK(check_language(TISPEECH_LANG_ENGLISH, &sv_lang_data_eng) == 0);
+    {
+        /* A hand-built "SVXF" dictionary: HELLO -> " XYZZY" in bucket 'H',
+         * every other bucket pointing at the terminator (userdict.h). */
+        static const char word[] = "HELLO", phon[] = " XYZZY";
+        uint8_t file[144 + 32] = {'S', 'V', 'X', 'F'};
+        uint8_t *table = file + 144;
+        uint32_t wl = sizeof word - 1, pl = sizeof phon - 1, term = 3 + wl + pl;
+        uint32_t table_len = term + 3;
+        tispeech_userdict *dict = (tispeech_userdict *)&file; /* poisoned */
+        char plain[256];
+        file[24] = 1;
+        memcpy(file + 28, &table_len, 4);
+        for (int b = 0; b < 28; b++)
+            memcpy(file + 32 + 4 * b, b == 'H' - 'A' ? &(uint32_t){0} : &term, 4);
+        table[0] = (uint8_t)(wl + pl);
+        table[1] = (uint8_t)wl;
+        table[2] = 0x02; /* ordinary entry, compared against normalised text */
+        memcpy(table + 3, word, wl);
+        memcpy(table + 3 + wl, phon, pl);
+
+        CHECK(tispeech_userdict_load(file, 144 + (int32_t)table_len, &dict) == TISPEECH_OK);
+        CHECK(dict != NULL);
+        CHECK(tispeech_text_to_phonemes_ex(1, "hello world", dict, output, sizeof output) == TISPEECH_OK);
+        CHECK(strstr(output, "XYZZY") != NULL && strstr(output, "WER5LD") != NULL);
+        CHECK(strstr(output, "HEH5LOW") == NULL);
+        /* Prefix only: HELLOS is a different word and misses the entry. */
+        CHECK(tispeech_text_to_phonemes_ex(1, "hellos", dict, output, sizeof output) == TISPEECH_OK);
+        CHECK(strstr(output, "XYZZY") == NULL);
+        /* NULL dictionary is exactly the plain entry point. */
+        CHECK(tispeech_text_to_phonemes_ex(1, "hello world", NULL, output, sizeof output) == TISPEECH_OK);
+        CHECK(tispeech_text_to_phonemes(1, "hello world", plain, sizeof plain) == TISPEECH_OK);
+        CHECK(strcmp(output, plain) == 0);
+        CHECK(tispeech_text_to_phonemes_ex(TISPEECH_LANG_SPANISH, "hola", dict, output, sizeof output)
+              == (languages & TISPEECH_LANG_SPANISH ? TISPEECH_E_NOTIMPL : TISPEECH_E_NOLANGUAGE));
+        tispeech_userdict_free(dict);
+
+        CHECK(tispeech_userdict_load(file, 100, &dict) == TISPEECH_E_DICTSHORT && dict == NULL);
+        file[0] = 'X';
+        CHECK(tispeech_userdict_load(file, 144 + (int32_t)table_len, &dict) == TISPEECH_E_DICTFORMAT);
+        CHECK(dict == NULL);
+        CHECK(tispeech_userdict_load(NULL, 0, &dict) == TISPEECH_E_BADPARAM);
+        CHECK(tispeech_userdict_load(file, 0, NULL) == TISPEECH_E_BADPARAM);
+        tispeech_userdict_free(NULL);
+    }
 #else
     CHECK((languages & TISPEECH_LANG_ENGLISH) == 0);
     CHECK(tispeech_text_to_phonemes(TISPEECH_LANG_ENGLISH, "hello", output, sizeof(output)) == TISPEECH_E_NOLANGUAGE);
