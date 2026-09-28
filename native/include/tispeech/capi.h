@@ -12,7 +12,7 @@
  * ----------------
  * tispeech_capabilities() reports what this build can really do. A caller must
  * gate on it rather than on the host operating system: a build without
- * language data cannot convert text, and no build can synthesise audio yet.
+ * language data cannot convert text, and synthesis needs base plus English data.
  * Entry points for stages that are not reconstructed return
  * TISPEECH_E_NOTIMPL. Nothing here returns success it did not earn.
  */
@@ -48,7 +48,7 @@ extern "C" {
 #define TISPEECH_LANG_GERMAN    0x4u
 
 /* Capability bits returned by tispeech_capabilities(). */
-#define TISPEECH_CAP_TEXT_TO_PHONEMES 0x1u /* sv_rules_apply is linked in */
+#define TISPEECH_CAP_TEXT_TO_PHONEMES 0x1u /* text conversion is built */
 #define TISPEECH_CAP_SYNTHESIS        0x2u /* phoneme -> PCM works end to end */
 
 /* Bitmask of TISPEECH_CAP_*. Cheap, side-effect free, safe to call first. */
@@ -64,42 +64,63 @@ TISPEECH_API const char *tispeech_build_info(void);
 
 /*
  * Grapheme-to-phoneme conversion. `text` is NUL-terminated UTF-8 restricted to
- * Latin-1 (the rule tables are 8-bit). UTF-8 is decoded and Latin-1 letters
- * are upper-cased independently of the process locale. Invalid UTF-8 and
- * characters above U+00FF return TISPEECH_E_BADPARAM. The result is written
+ * Latin-1 (the rule tables are 8-bit). Normalisation is locale-independent.
+ * Invalid UTF-8 and characters above U+00FF return TISPEECH_E_BADPARAM. The result is written
  * to `out` as a NUL-terminated phoneme string.
  *
  * Returns TISPEECH_OK, or TISPEECH_E_NOLANGUAGE when this build has no data
  * for `language`, TISPEECH_E_BUFFERFULL when `out` is too small, or
  * TISPEECH_E_BADPARAM / TISPEECH_E_NULLTEXT for bad arguments.
  *
- * This covers the letter-to-sound rules only. Text normalisation (numbers,
- * abbreviations) and the user dictionary run ahead of this stage in the
- * original and are NOT reconstructed, so input containing digits or
- * abbreviations will not match the original engine's output.
+ * English uses SVTextToPhon's normalisation, exception dictionary, number
+ * expansion, letter-to-sound and default-stress stages, retaining original
+ * spacing. English input is limited to 514 decoded Latin-1 bytes; longer
+ * input returns TISPEECH_E_BADPARAM instead of the original's silent empty
+ * output. Spanish currently covers letter-to-sound rules only. User
+ * dictionaries are not implemented. On failure, a valid output buffer is
+ * cleared; callers can grow it and retry TISPEECH_E_BUFFERFULL.
  */
 TISPEECH_API int32_t tispeech_text_to_phonemes(uint32_t language,
                                                const char *text,
                                                char *out, int32_t out_size);
 
 /*
- * Phoneme-to-PCM synthesis.
+ * Phoneme-to-PCM synthesis: SVNarrate's pipeline, reconstructed. `phonemes`
+ * is a SoftVoice phoneme string (the alphabet SVTextToPhon produces, e.g.
+ * " /HEH5LOW WER5LD"). The output is unsigned 8-bit mono PCM at
+ * `*out_sample_rate` (11025), laid out exactly as the original's waveOut
+ * stream: each sentence starts with 0x2000 samples, then 0x1000 per buffer,
+ * the last one padded with silence (0x80).
  *
- * NOT IMPLEMENTED. The waveform kernel is reconstructed and verified
- * bit-exact, but the stage that turns a phoneme string into the parameter
- * frames that drive it is not. This entry point exists so callers can link and
- * gate against a stable signature; it returns TISPEECH_E_NOTIMPL until the
- * frame generator lands, and must never be changed to return silence or
- * substitute audio instead.
+ * Verified sample-for-sample against the original engine run under an
+ * emulator (tools/verify_narrate.py). English only; the voice is SVOpenSpeech's
+ * default (row 0).
  *
- * On success (once implemented) `*out_samples` receives a buffer owned by the
- * library, to be released with tispeech_free_samples().
+ * Returns TISPEECH_OK, TISPEECH_E_NOTIMPL when this build has no synthesis
+ * data (see tispeech_capabilities()) or the string uses an inline-command
+ * form not yet reconstructed ("{...}"), TISPEECH_E_NOLANGUAGE for a language
+ * other than English, TISPEECH_E_BADPARAM for an unknown phoneme name, or
+ * TISPEECH_E_OUTOFMEMORY. On success `*out_samples` is owned by the library;
+ * release it with tispeech_free_samples().
  */
 TISPEECH_API int32_t tispeech_synthesize(uint32_t language,
                                          const char *phonemes,
                                          uint8_t **out_samples,
                                          int32_t *out_count,
                                          int32_t *out_sample_rate);
+
+/* Voice controls. -1 preserves the selected personality's value. Personality
+ * is 0..19; pitch 10..2000, rate 20..500, voicing 0..2, F0 style 0..4,
+ * F0 range/perturb 0..500, vowel factor 0..65535, glottal source 0..8.
+ * The default ABI above remains unchanged; NULL options selects voice row 0. */
+typedef struct tispeech_voice_options {
+    int32_t personality, pitch, rate, voicing, f0_style;
+    int32_t f0_range, f0_perturb, vowel_factor, glottal_source;
+} tispeech_voice_options;
+
+TISPEECH_API int32_t tispeech_synthesize_ex(uint32_t language,
+    const char *phonemes, const tispeech_voice_options *options,
+    uint8_t **out_samples, int32_t *out_count, int32_t *out_sample_rate);
 
 TISPEECH_API void tispeech_free_samples(uint8_t *samples);
 

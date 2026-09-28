@@ -7,7 +7,7 @@
  * Ghidra decompilation of TIENG32.DLL at VA 0x1C206860, cross-checked against
  * `llvm-objdump -d`. Helpers FUN_1c207180 (accent test) and FUN_1c2070b0
  * (accent stripping) at 0x1C207180 / 0x1C2070B0 are reconstructed inline as
- * sv_is_accented() / sv_strip_accent().
+ * sv_rule_accented() / sv_rule_strip_accent().
  *
  * Control flow has been restructured from the decompiler's goto soup into
  * ordinary loops. The restructuring is behaviour-preserving; every branch is
@@ -32,7 +32,7 @@
 /* FUN_1c207180 — true for the accented Latin-1 letters the ruleset spells
  * out literally. When a RULE character is one of these, the input character is
  * compared verbatim instead of being accent-stripped first. */
-static int sv_is_accented(unsigned char c)
+int sv_rule_accented(unsigned char c)
 {
     switch (c) {
     case 0xc1: case 0xc9: case 0xcd: case 0xd1: case 0xd3: case 0xda:
@@ -46,7 +46,7 @@ static int sv_is_accented(unsigned char c)
 
 /* FUN_1c2070b0 — strip the accent off a vowel. Guarded by the vowel bit, so a
  * non-vowel is returned untouched even if it happens to be one of the cases. */
-static unsigned char sv_strip_accent(const sv_ruleset_t *rs, unsigned char c)
+unsigned char sv_rule_strip_accent(const sv_ruleset_t *rs, unsigned char c)
 {
     if ((rs->charclass[c] & SV_CC_VOWEL) == 0)
         return c;
@@ -70,8 +70,8 @@ static int sv_isspace(unsigned char c)
  * accent-stripping rule above. */
 static int sv_chreq(const sv_ruleset_t *rs, unsigned char rule_ch, unsigned char in_ch)
 {
-    if (!sv_is_accented(rule_ch))
-        in_ch = sv_strip_accent(rs, in_ch);
+    if (!sv_rule_accented(rule_ch))
+        in_ch = sv_rule_strip_accent(rs, in_ch);
     return rule_ch == in_ch;
 }
 
@@ -334,28 +334,23 @@ static int sv_match_context(const sv_ruleset_t *rs,
     }
 }
 
-int sv_rules_apply_ex(const sv_ruleset_t *rs, const char *in,
-                      char *out, size_t out_size, unsigned opts,
-                      unsigned *out_flags, size_t *out_consumed)
+/*
+ * The body of FUN_1c206860. `*pp` is the input cursor and `*opp` the output
+ * cursor (always on a NUL); both advance as rules fire, `*out_left` shrinks
+ * by each rule's output, and `*last_flags` takes the flags of every rule that
+ * fires. Returns 1, with everything as it was after the last rule that fit,
+ * when a rule's output does not fit in `*out_left`; otherwise 0.
+ */
+static int sv_rules_run(const sv_ruleset_t *rs, const unsigned char *in_floor,
+                        const unsigned char **pp, char **opp, size_t *out_left,
+                        unsigned opts, unsigned *last_flags)
 {
     const unsigned short *cc    = rs->charclass;
-    const unsigned char  *p     = (const unsigned char *)in;
+    const unsigned char  *p     = *pp;
     const unsigned char  *floor = sv_blob_floor(rs);
-    const unsigned char  *in_floor = (const unsigned char *)in;
-    const unsigned char  *in_ceil  = in_floor + strlen(in);
-    char                 *op    = out;
-    size_t                out_left;
+    const unsigned char  *in_ceil = p + strlen((const char *)p);
+    char                 *op    = *opp;
     int                   used_fallback = 0;
-    unsigned              last_flags = 0;
-
-    if (out_flags != NULL)
-        *out_flags = 0;
-    if (out_consumed != NULL)
-        *out_consumed = 0;
-    if (out_size == 0)
-        return 1;
-    *op = '\0';
-    out_left = out_size - 1;
 
     for (;;) {
         unsigned char c = *p;
@@ -454,19 +449,22 @@ int sv_rules_apply_ex(const sv_ruleset_t *rs, const char *in,
                         scan++;
                     }
 
-                    if (n > out_left)
+                    if (n > *out_left) {
+                        *pp = p;
+                        *opp = op;
                         return 1;
+                    }
 
                     if ((opts & 0x40u) == 0 && *p == '?' && n == 1) {
                         *op++ = (char)rs->qmark_sub;
-                        out_left -= 1;
+                        *out_left -= 1;
                     } else {
                         memcpy(op, o, n);
                         op += n;
-                        out_left -= n;
+                        *out_left -= n;
                     }
                     *op = '\0';
-                    last_flags = flags;
+                    *last_flags = flags;
                 }
 
                 p = q; /* consume the literal */
@@ -479,11 +477,52 @@ int sv_rules_apply_ex(const sv_ruleset_t *rs, const char *in,
     }
 
     *op = '\0';
+    *pp = p;
+    *opp = op;
+    return 0;
+}
+
+int sv_rules_apply_ex(const sv_ruleset_t *rs, const char *in,
+                      char *out, size_t out_size, unsigned opts,
+                      unsigned *out_flags, size_t *out_consumed)
+{
+    const unsigned char *p = (const unsigned char *)in;
+    char *op = out;
+    size_t out_left;
+    unsigned last_flags = 0;
+
+    if (out_flags != NULL)
+        *out_flags = 0;
+    if (out_consumed != NULL)
+        *out_consumed = 0;
+    if (out_size == 0)
+        return 1;
+    *op = '\0';
+    out_left = out_size - 1;
+
+    if (sv_rules_run(rs, (const unsigned char *)in, &p, &op, &out_left, opts,
+                     &last_flags))
+        return 1;
     if (out_flags != NULL)
         *out_flags = last_flags;
     if (out_consumed != NULL)
         *out_consumed = (size_t)((const char *)p - in);
     return 0;
+}
+
+int sv_rules_step(const sv_ruleset_t *rs, const char *floor, const char **in,
+                  char **out, int32_t *out_left, unsigned opts, uint32_t *status)
+{
+    const unsigned char *p = (const unsigned char *)*in;
+    size_t left = *out_left > 0 ? (size_t)*out_left : 0;
+    unsigned flags = *status;
+    int rc;
+
+    rc = sv_rules_run(rs, (const unsigned char *)floor, &p, out, &left, opts, &flags);
+    *in = (const char *)p;
+    *out_left = (int32_t)left;
+    *status = rc ? 0 : flags; /* 0x1c206ff0: the full-buffer path clears it */
+    return rc;
 }
 
 int sv_rules_apply(const sv_ruleset_t *rs, const char *in,

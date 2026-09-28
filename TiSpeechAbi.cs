@@ -115,9 +115,10 @@ public sealed record TiPhonemeResult(TiStatus Status, string Phonemes, string? M
 /// a caller that ignores <see cref="Status"/> cannot mistake it for silence it
 /// may play.
 /// </summary>
-public sealed record TiSynthesisResult(TiStatus Status, byte[]? Samples, int SampleRate)
+public sealed record TiSynthesisResult(TiStatus Status, byte[]? Samples, int SampleRate, string? Message = null)
 {
     public bool IsSuccess => Status == TiStatus.Ok && Samples is not null;
 
-    public static TiSynthesisResult Failure(TiStatus status) => new(status, null, 0);
+    public static TiSynthesisResult Failure(TiStatus status, string? message = null) =>
+        new(status, null, 0, message ?? status.Describe());
 }

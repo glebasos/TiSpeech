@@ -56,6 +56,7 @@
 #define TISPEECH_RULESET_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -130,6 +131,24 @@ int sv_rules_apply(const sv_ruleset_t *rules, const char *in,
 int sv_rules_apply_ex(const sv_ruleset_t *rules, const char *in,
                       char *out, size_t out_size, unsigned opts,
                       unsigned *out_flags, size_t *out_consumed);
+
+/*
+ * FUN_1c206860 as the text front end calls it (src/textphon_eng.c): one word
+ * at `*in`, inside a working buffer whose first byte is `floor`, appended at
+ * `*out` (which is on the output's NUL). `*in`, `*out` and `*out_left` advance
+ * as rules fire and `*status` takes the SV_RF_* flags of the last rule that
+ * fired, exactly as the original updates its context block; nothing moves
+ * when the cursor starts on a space. Returns 1, with `*status` cleared, when
+ * a rule's output would not fit in `*out_left`; otherwise 0.
+ */
+int sv_rules_step(const sv_ruleset_t *rules, const char *floor, const char **in,
+                  char **out, int32_t *out_left, unsigned opts, uint32_t *status);
+
+/* FUN_1c207180 / FUN_1c2070b0, shared with the exception matcher: a rule
+ * character that is one of the accented letters is compared verbatim;
+ * otherwise the input character is accent-stripped first. */
+int sv_rule_accented(unsigned char c);
+unsigned char sv_rule_strip_accent(const sv_ruleset_t *rules, unsigned char c);
 
 /* Provided by the generated translation unit (tools/extract_lang.py). */
 extern const sv_ruleset_t sv_lang_data_eng;

@@ -4,19 +4,24 @@ A .NET 10 library for the SoftVoice speech engine originally shipped with Micros
 
 ## Portable reconstruction
 
-`native/` contains reconstructed letter-to-sound rules, the fixed-point waveform
-kernel, a frame renderer, two leaf stages of the phoneme-to-frame generator and
-both pitch-smoothing passes that follow it — each verified bit-exact against the
-original DLLs. `TiSpeechNative` exposes the available stages
-through a C ABI; `NativeTiSpeechBackend` implements the application's shared
-backend interfaces. English and Spanish phoneme previews work when their
-respective language data is built in (`TISPEECH_ENG_DLL` / `TISPEECH_SPAN_DLL`
-for CMake, `TiSpeechEngDll` / `TiSpeechSpanDll` for MSBuild). These expose the
-letter-to-sound matcher, not the original engine's complete text normaliser.
-**Speech synthesis is not available yet:** the generator driver that would turn
-those stages into parameter frames, the last post-generation pass, and the
-native playback path are still missing. `Synthesize` returns `NotImplemented`,
-with no audio buffer or substitute voice.
+`native/` reconstructs the English text front end and the full phoneme-to-PCM
+pipeline. `TiSpeechNative.TextToPhonemes` includes exception pronunciations,
+number expansion and default stress for English; Spanish currently has only
+letter-to-sound conversion. English input is limited to 514 Latin-1 characters
+per call. Longer passages return an explicit error.
+
+With both `TIENG32.DLL` and `TIBASE32.DLL` supplied at build time,
+`TiSpeechNative.Synthesize` returns original-voice 8-bit mono PCM at 11025 Hz.
+The complete text-to-audio path has been compared sample for sample with the
+original engine. The `svsay -t "hello world" out.wav` native tool converts plain
+text directly to a WAV file. Inline synthesis commands and user dictionaries
+remain unsupported.
+
+**Application playback is not wired up yet.** `NativeTiSpeechBackend.Open`
+still returns false and Talk/Export remain disabled; library callers and
+`svsay` can already generate audio. CMake uses `TISPEECH_ENG_DLL`,
+`TISPEECH_SPAN_DLL`, and `TISPEECH_BASE_DLL`; MSBuild accepts `TiSpeechEngDll`,
+`TiSpeechSpanDll`, and `TiSpeechBaseDll` and detects copies in OpenTalkIt/DLLs.
 
 Language tables are extracted at build time from original DLLs you supply; no
 proprietary table data is stored in source control. The runtime neither loads

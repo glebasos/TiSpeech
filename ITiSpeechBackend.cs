@@ -4,9 +4,9 @@ namespace TiSpeech;
 /// Letter-to-sound conversion, independent of whether anything can speak.
 ///
 /// It is deliberately separate from <see cref="ITiSpeechBackend"/>: the native
-/// reconstruction converts text to phonemes on every platform today while
-/// synthesising nothing at all, and the Windows pipe/host backend is the
-/// other way round. A caller that wants phonemes should ask a provider, not a
+/// reconstruction converts text to phonemes on every platform independently
+/// of application playback, while the Windows pipe/host backend exposes speech
+/// playback through a separate process. A caller that wants phonemes should ask a provider, not a
 /// speech engine.
 /// </summary>
 public interface ITiPhonemeProvider

@@ -1,186 +1,227 @@
 namespace TiSpeech;
 
-/// <summary>
-/// <see cref="ITiSpeechBackend"/> / <see cref="ITiPhonemeProvider"/> over the
-/// from-scratch native reconstruction (<see cref="TiSpeechNative"/>).
-///
-/// What it really does today, and nothing more:
-///   * letter-to-sound conversion, natively, on macOS/Linux/Windows alike;
-///   * reports <see cref="TiEngineCapabilities"/> straight from
-///     <c>tispeech_capabilities()</c>.
-///
-/// What it deliberately does NOT do: speak. <see cref="Open"/> returns false and
-/// <see cref="Speak"/> reports the native <c>TISPEECH_E_NOTIMPL</c> through
-/// <see cref="Error"/>. There is no fallback to a system voice, no silence
-/// passed off as output, and no Wine/emulation shim. When the phoneme-to-frame
-/// stage lands in the native library, whoever wires up playback changes this
-/// class — until then it must keep saying no.
-/// </summary>
-public sealed class NativeTiSpeechBackend : ITiSpeechBackend, ITiPhonemeProvider
+/// <summary>A speech backend that can also render directly to PCM for WAV export.</summary>
+public interface ITiPcmRenderer
 {
+    bool CanRender { get; }
+    Task<TiSynthesisResult> RenderAsync(string text, CancellationToken cancellationToken = default);
+}
+
+internal interface INativePcmSynthesizer
+{
+    TiEngineCapabilities Capabilities { get; }
+    TiLanguageFlags Languages { get; }
+    string? UnavailableReason { get; }
+    TiSynthesisResult Render(TiLanguage language, string text, TiVoiceOptions options);
+}
+
+internal sealed class NativePcmSynthesizer : INativePcmSynthesizer
+{
+    public TiEngineCapabilities Capabilities => TiSpeechNative.Capabilities;
+    public TiLanguageFlags Languages => TiSpeechNative.Languages;
+    public string? UnavailableReason => !TiSpeechNative.IsAvailable ? TiSpeechNative.UnavailableReason
+        : !Capabilities.HasFlag(TiEngineCapabilities.Synthesis)
+            ? "English synthesis data is unavailable (TISPEECH_E_NOTIMPL). Rebuild with TIBASE32.DLL and TIENG32.DLL."
+            : null;
+    public TiSynthesisResult Render(TiLanguage language, string text, TiVoiceOptions options) =>
+        TiSpeechNative.SynthesizeText(language, text, options);
+}
+
+/// <summary>
+/// Native English text-to-speech with asynchronous playback. Each utterance
+/// snapshots its voice settings; cancelled work can never start or complete a
+/// replacement utterance. Phoneme previews and PCM export need no audio device.
+/// </summary>
+public sealed class NativeTiSpeechBackend : ITiSpeechBackend, ITiPhonemeProvider, ITiPcmRenderer
+{
+    private readonly Lock _sync = new();
+    private readonly SemaphoreSlim _playbackGate = new(1);
+    private readonly IPcmPlayer _player;
+    private readonly INativePcmSynthesizer _synthesizer;
+    private TiVoiceOptions _voice = new();
     private TiLanguage _language = TiLanguage.English;
-    private bool _disposed;
+    private TiSpeakingMode _speakingMode = TiSpeakingMode.Natural;
+    private bool _open, _disposed, _paused;
+    private CancellationTokenSource? _active;
+    private string? _openError;
+
+    public NativeTiSpeechBackend() : this(new SystemPcmPlayer()) { }
+    public NativeTiSpeechBackend(IPcmPlayer player) : this(player, new NativePcmSynthesizer()) { }
+    internal NativeTiSpeechBackend(IPcmPlayer player, INativePcmSynthesizer synthesizer)
+    {
+        _player = player;
+        _synthesizer = synthesizer;
+    }
 
     public string Name => "native reconstruction";
-
-    // CS0067: SpeakStarted is intentionally never raised. It is part of
-    // ITiSpeechBackend and this backend never starts speaking, so the absence of
-    // an invocation is the point, not an oversight.
-#pragma warning disable CS0067
     public event EventHandler? SpeakStarted;
-#pragma warning restore CS0067
     public event EventHandler? SpeakCompleted;
     public event EventHandler<string>? Error;
-
-    public TiEngineCapabilities Capabilities => TiSpeechNative.Capabilities;
-
+    public TiEngineCapabilities Capabilities => IsOpen ? _synthesizer.Capabilities
+        : _synthesizer.Capabilities & ~TiEngineCapabilities.Synthesis;
     public TiLanguageFlags SupportedLanguages => TiSpeechNative.Languages;
-
     public string? BuildInfo => TiSpeechNative.BuildInfo;
+    public bool IsOpen { get { lock (_sync) return _open; } }
+    public bool IsSpeaking { get { lock (_sync) return _active is not null; } }
+    public bool CanRender => _synthesizer.UnavailableReason is null;
+    public string? UnavailableReason => IsOpen ? null
+        : _openError ?? _synthesizer.UnavailableReason ?? _player.UnavailableReason;
 
-    /// <summary>
-    /// Always false: this backend has no playback path. See
-    /// <see cref="UnavailableReason"/> for the specific reason, which
-    /// distinguishes "library not built" from "built, but synthesis is not
-    /// reconstructed".
-    /// </summary>
-    public bool IsOpen => false;
-
-    /// <summary>Always false: nothing here ever starts speaking.</summary>
-    public bool IsSpeaking => false;
-
-    // ── ITiSpeechBackend: diagnostics ─────────────────────────────────────────
-
-    public string? UnavailableReason
-    {
-        get
-        {
-            if (!TiSpeechNative.IsAvailable)
-                return TiSpeechNative.UnavailableReason;
-
-            if (Capabilities.HasFlag(TiEngineCapabilities.Synthesis))
-            {
-                // Not reachable with today's native library, which never sets
-                // this bit. Kept as a real branch so that if a future build does
-                // set it, this class says "not wired up yet" instead of silently
-                // implying it works.
-                return "The native library reports synthesis support, but this backend has no audio " +
-                       "playback path wired up yet.";
-            }
-
-            var phonemeStatus = Capabilities.HasFlag(TiEngineCapabilities.TextToPhonemes)
-                                && SupportedLanguages != 0
-                ? "Letter-to-sound conversion does work — see the Phonemes button."
-                : "This build also has no letter-to-sound language data.";
-            return "Speech synthesis is not implemented in the native engine reconstruction yet: " +
-                   "tispeech_synthesize() returns TISPEECH_E_NOTIMPL, so Talk and WAV export stay disabled. " +
-                   phonemeStatus;
-        }
-    }
-
-    // ── ITiPhonemeProvider ────────────────────────────────────────────────────
-
-    /// <summary>
-    /// True only when the native library loaded, reports
-    /// <see cref="TiEngineCapabilities.TextToPhonemes"/>, and actually has rule
-    /// data for at least one language.
-    /// </summary>
-    bool ITiPhonemeProvider.IsAvailable =>
-        TiSpeechNative.IsAvailable
-        && Capabilities.HasFlag(TiEngineCapabilities.TextToPhonemes)
-        && SupportedLanguages != 0;
-
-    string? ITiPhonemeProvider.UnavailableReason
-    {
-        get
-        {
-            if (!TiSpeechNative.IsAvailable)
-                return TiSpeechNative.UnavailableReason;
-
-            if (SupportedLanguages == 0 || !Capabilities.HasFlag(TiEngineCapabilities.TextToPhonemes))
-                return "The TiSpeech native library is loaded but was built without language data, so it " +
-                       "cannot convert text to phonemes. The rule tables belong to SoftVoice and are not in " +
-                       "this repository: configure the native build with " +
-                       "-DTISPEECH_ENG_DLL=<path to your own TIENG32.DLL> and rebuild.";
-
-            return null;
-        }
-    }
-
-    string? ITiPhonemeProvider.UnavailableDetail =>
-        TiSpeechNative.IsAvailable ? null : TiSpeechNative.UnavailableDetail;
-
+    bool ITiPhonemeProvider.IsAvailable => TiSpeechNative.IsAvailable
+        && TiSpeechNative.Capabilities.HasFlag(TiEngineCapabilities.TextToPhonemes);
+    string? ITiPhonemeProvider.UnavailableReason => !TiSpeechNative.IsAvailable
+        ? TiSpeechNative.UnavailableReason : TiSpeechNative.Languages == 0
+            ? "The native library was built without language data. Rebuild with TIENG32.DLL or TISPAN32.DLL."
+            : null;
+    string? ITiPhonemeProvider.UnavailableDetail => TiSpeechNative.UnavailableDetail;
     public TiPhonemeResult TextToPhonemes(TiLanguage language, string text) =>
         TiSpeechNative.TextToPhonemes(language, text);
 
-    // ── ITiSpeechBackend: lifecycle ───────────────────────────────────────────
-
-    /// <summary>
-    /// Always returns false and raises <see cref="Error"/> with
-    /// <see cref="UnavailableReason"/>. Returning true here would be the single
-    /// most damaging lie this project could tell, because every Talk/Export gate
-    /// in the UI keys off it.
-    /// </summary>
     public bool Open(TiLanguageFlags languages = TiLanguageFlags.English)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        Error?.Invoke(this, UnavailableReason ?? "The native engine reconstruction cannot synthesise speech yet.");
-        return false;
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _openError = !languages.HasFlag(TiLanguageFlags.English)
+                ? "Native speech currently supports English only."
+                : _synthesizer.UnavailableReason ?? _player.UnavailableReason;
+            if (_openError is not null)
+            {
+                _open = false;
+                Error?.Invoke(this, _openError);
+                return false;
+            }
+            _open = true;
+            return true;
+        }
     }
 
-    public void Close() { }
+    public Task<TiSynthesisResult> RenderAsync(string text, CancellationToken cancellationToken = default)
+    {
+        TiVoiceOptions voice;
+        TiLanguage language;
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            voice = _voice;
+            language = _language;
+            if (_speakingMode != TiSpeakingMode.Natural)
+                return Task.FromResult(TiSynthesisResult.Failure(TiStatus.NotImplemented,
+                    "Native speech currently supports the natural speaking mode only."));
+        }
+        return Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var result = _synthesizer.Render(language, text, voice);
+            cancellationToken.ThrowIfCancellationRequested();
+            return result;
+        }, cancellationToken);
+    }
 
-    /// <summary>
-    /// Calls the real <c>tispeech_synthesize()</c> so the reported status is the
-    /// engine's own answer rather than a hardcoded string, reports it through
-    /// <see cref="Error"/>, and produces no audio.
-    ///
-    /// <see cref="SpeakCompleted"/> is raised immediately afterwards purely so a
-    /// caller awaiting it is released rather than deadlocking; <see cref="Error"/>
-    /// has already fired and <see cref="SpeakStarted"/> never does, so nothing
-    /// can read this as speech having happened.
-    /// </summary>
     public void Speak(string text, bool interrupt = true)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-
-        var result = TiSpeechNative.Synthesize(_language, text ?? string.Empty);
-        Error?.Invoke(this,
-            $"The native engine reconstruction produced no audio: {result.Status.Describe()} " +
-            "No substitute or system voice is used by design.");
-        SpeakCompleted?.Invoke(this, EventArgs.Empty);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_open)
+            {
+                Error?.Invoke(this, UnavailableReason ?? "Open the speech backend before speaking.");
+                SpeakCompleted?.Invoke(this, EventArgs.Empty);
+                return;
+            }
+            if (_active is not null && !interrupt)
+            {
+                Error?.Invoke(this, "Speech is already in progress.");
+                return;
+            }
+            _active?.Cancel();
+            var request = new CancellationTokenSource();
+            _active = request;
+            _paused = false;
+            // RenderAsync snapshots settings here, before another utterance can change them.
+            var render = RenderAsync(text, request.Token);
+            _ = RunAsync(request, render);
+        }
     }
 
-    public void Stop() { }
-    public void Pause() { }
-    public void Resume() { }
+    private async Task RunAsync(CancellationTokenSource request, Task<TiSynthesisResult> render)
+    {
+        bool entered = false;
+        try
+        {
+            var result = await render.ConfigureAwait(false);
+            request.Token.ThrowIfCancellationRequested();
+            if (!result.IsSuccess)
+                throw new InvalidOperationException(result.Message ?? result.Status.Describe());
+            await _playbackGate.WaitAsync(request.Token).ConfigureAwait(false);
+            entered = true;
+            request.Token.ThrowIfCancellationRequested();
+            lock (_sync)
+            {
+                _player.Resume();
+                if (_paused) _player.Pause();
+            }
+            await _player.PlayAsync(result.Samples!, result.SampleRate, () =>
+            {
+                lock (_sync)
+                    if (ReferenceEquals(_active, request)) SpeakStarted?.Invoke(this, EventArgs.Empty);
+            }, request.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (request.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            lock (_sync)
+                if (ReferenceEquals(_active, request)) Error?.Invoke(this, ex.Message);
+        }
+        finally
+        {
+            if (entered) _playbackGate.Release();
+            lock (_sync)
+            {
+                if (ReferenceEquals(_active, request))
+                {
+                    _active = null;
+                    SpeakCompleted?.Invoke(this, EventArgs.Empty);
+                }
+                request.Dispose();
+            }
+        }
+    }
 
-    // ── ITiSpeechBackend: voice parameters ────────────────────────────────────
-    //
-    // Accepted and discarded. There is no synthesis state to apply them to, and
-    // storing them would only create the impression that they took effect.
-    // Speak() reports TISPEECH_E_NOTIMPL regardless of what was set here, so no
-    // caller can mistake a "set" parameter for an applied one. SetLanguage is
-    // the exception: it selects the rule table used by TextToPhonemes.
+    public void Stop()
+    {
+        lock (_sync)
+        {
+            var active = _active;
+            if (active is null) return;
+            _active = null;
+            active.Cancel();
+            SpeakCompleted?.Invoke(this, EventArgs.Empty);
+        }
+    }
+    public void Pause() { lock (_sync) { if (_active is not null) { _paused = true; _player.Pause(); } } }
+    public void Resume() { lock (_sync) { if (_active is not null) { _paused = false; _player.Resume(); } } }
+    public void Close() { lock (_sync) { _open = false; Stop(); } }
 
-    public void SetLanguage(TiLanguage language) => _language = language;
-
-    public void SetPersonality(TiPersonality personality) { }
-    public void SetPitch(int value) { }
-    public void SetRate(int value) { }
-    public void SetVoicingMode(TiVoicingMode mode) { }
-    public void SetF0Style(TiF0Style style) { }
-    public void SetSpeakingMode(TiSpeakingMode mode) { }
-    public void SetF0Range(int value) { }
-    public void SetF0Perturb(int value) { }
-    public void SetVowelFactor(int value) { }
-    public void SetGlottalSource(TiGlottalSource source) { }
-
+    public void SetLanguage(TiLanguage value) { lock (_sync) _language = value; }
+    public void SetPersonality(TiPersonality value) { lock (_sync) _voice = new(value); }
+    public void SetPitch(int value) { lock (_sync) _voice = _voice with { Pitch = value }; }
+    public void SetRate(int value) { lock (_sync) _voice = _voice with { Rate = value }; }
+    public void SetVoicingMode(TiVoicingMode value) { lock (_sync) _voice = _voice with { Voicing = (int)value }; }
+    public void SetF0Style(TiF0Style value) { lock (_sync) _voice = _voice with { F0Style = (int)value }; }
+    public void SetSpeakingMode(TiSpeakingMode value) { lock (_sync) _speakingMode = value; }
+    public void SetF0Range(int value) { lock (_sync) _voice = _voice with { F0Range = value }; }
+    public void SetF0Perturb(int value) { lock (_sync) _voice = _voice with { F0Perturb = value }; }
+    public void SetVowelFactor(int value) { lock (_sync) _voice = _voice with { VowelFactor = value }; }
+    public void SetGlottalSource(TiGlottalSource value) { lock (_sync) _voice = _voice with { GlottalSource = (int)value }; }
     public void Dispose()
     {
-        _disposed = true;
-        // The native library holds no per-instance state: capi.c's entry points
-        // are pure functions over static rule tables, so there is nothing to
-        // release and no handle to close.
+        lock (_sync)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            Close();
+            _player.Dispose();
+        }
     }
 }

@@ -49,6 +49,8 @@
     <TiSpeechNativeDir>$(MSBuildThisFileDirectory)native</TiSpeechNativeDir>
     <TiSpeechEngDll Condition="'$(TiSpeechEngDll)' == ''">$(MSBuildThisFileDirectory)..\OpenTalkIt\DLLs\TIENG32.DLL</TiSpeechEngDll>
     <TiSpeechSpanDll Condition="'$(TiSpeechSpanDll)' == ''">$(MSBuildThisFileDirectory)..\OpenTalkIt\DLLs\TISPAN32.DLL</TiSpeechSpanDll>
+    <TiSpeechBaseDll Condition="'$(TiSpeechBaseDll)' == ''">$(MSBuildThisFileDirectory)..\OpenTalkIt\DLLs\TIBASE32.DLL</TiSpeechBaseDll>
+    <_TiSpeechAvailableBaseDll Condition="Exists('$(TiSpeechBaseDll)')">$(TiSpeechBaseDll)</_TiSpeechAvailableBaseDll>
     <_TiSpeechAvailableEngDll Condition="Exists('$(TiSpeechEngDll)')">$(TiSpeechEngDll)</_TiSpeechAvailableEngDll>
     <_TiSpeechAvailableSpanDll Condition="Exists('$(TiSpeechSpanDll)')">$(TiSpeechSpanDll)</_TiSpeechAvailableSpanDll>
     <TiSpeechNativeBuildDir>$(MSBuildThisFileDirectory)obj\native</TiSpeechNativeBuildDir>
@@ -67,7 +69,7 @@
        resolved before a target runs, so an item created inside it would be
        empty here and the incremental check would miss source edits. -->
   <ItemGroup>
-    <TiSpeechNativeSource Include="$(TiSpeechNativeDir)\src\*.c;$(TiSpeechNativeDir)\include\tispeech\*.h;$(TiSpeechNativeDir)\tools\extract_*.py" />
+    <TiSpeechNativeSource Include="$(TiSpeechNativeDir)\src\*.c;$(TiSpeechNativeDir)\src\*.h;$(TiSpeechNativeDir)\include\tispeech\*.h;$(TiSpeechNativeDir)\tools\extract_*.py" />
   </ItemGroup>
 
   <!-- Path selections are inputs too: changing to a different DLL with an older
@@ -76,7 +78,7 @@
           Condition="'$(TiSpeechBuildNative)' == 'true' AND Exists('$(TiSpeechNativeDir)\CMakeLists.txt') AND (Exists('$(TiSpeechEngDll)') OR Exists('$(TiSpeechSpanDll)'))">
     <MakeDir Directories="$(TiSpeechNativeBuildDir)" ContinueOnError="true" />
     <WriteLinesToFile File="$(TiSpeechNativeInputs)"
-                      Lines="English=$(_TiSpeechAvailableEngDll);Spanish=$(_TiSpeechAvailableSpanDll)"
+                      Lines="English=$(_TiSpeechAvailableEngDll);Spanish=$(_TiSpeechAvailableSpanDll);Base=$(_TiSpeechAvailableBaseDll)"
                       Overwrite="true" WriteOnlyWhenDifferent="true" ContinueOnError="true" />
   </Target>
 
@@ -89,7 +91,7 @@
   <Target Name="BuildTiSpeechNative"
           DependsOnTargets="PrepareTiSpeechNativeBuild"
           Condition="'$(TiSpeechBuildNative)' == 'true' AND Exists('$(TiSpeechNativeDir)\CMakeLists.txt') AND (Exists('$(TiSpeechEngDll)') OR Exists('$(TiSpeechSpanDll)'))"
-          Inputs="$(MSBuildProjectFullPath);$(TiSpeechNativeInputs);$(TiSpeechNativeDir)\CMakeLists.txt;$(_TiSpeechAvailableEngDll);$(_TiSpeechAvailableSpanDll);@(TiSpeechNativeSource)"
+          Inputs="$(MSBuildProjectFullPath);$(TiSpeechNativeInputs);$(TiSpeechNativeDir)\CMakeLists.txt;$(_TiSpeechAvailableEngDll);$(_TiSpeechAvailableSpanDll);$(_TiSpeechAvailableBaseDll);@(TiSpeechNativeSource)"
           Outputs="$(TiSpeechNativeLib)">
 
     <!-- Is cmake on PATH? IgnoreExitCode makes "no" silent: no warning, no
@@ -108,7 +110,7 @@
     <Message Importance="normal" Condition="'$(_TiSpeechCMakeProbe)' == '0'"
              Text="TiSpeech: building the native engine reconstruction with CMake (using available language DLLs)." />
 
-    <Exec Command="cmake -S &quot;$(TiSpeechNativeDir)&quot; -B &quot;$(TiSpeechNativeBuildDir)&quot; -DCMAKE_BUILD_TYPE=Release -DTISPEECH_ENG_DLL=&quot;$(_TiSpeechAvailableEngDll)&quot; -DTISPEECH_SPAN_DLL=&quot;$(_TiSpeechAvailableSpanDll)&quot;"
+    <Exec Command="cmake -S &quot;$(TiSpeechNativeDir)&quot; -B &quot;$(TiSpeechNativeBuildDir)&quot; -DCMAKE_BUILD_TYPE=Release -DTISPEECH_ENG_DLL=&quot;$(_TiSpeechAvailableEngDll)&quot; -DTISPEECH_SPAN_DLL=&quot;$(_TiSpeechAvailableSpanDll)&quot; -DTISPEECH_BASE_DLL=&quot;$(_TiSpeechAvailableBaseDll)&quot;"
           Condition="'$(_TiSpeechCMakeProbe)' == '0'"
           IgnoreExitCode="true"
           StandardOutputImportance="low" StandardErrorImportance="low">

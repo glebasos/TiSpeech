@@ -52,6 +52,17 @@ target_link_libraries(tispeech_smoothing PUBLIC tispeech_frames)
 add_library(tispeech_generator STATIC src/generator.c)
 target_include_directories(tispeech_generator PUBLIC include)
 
+# ---------------------------------------------------------------------------
+# The narrate pipeline: phoneme string -> records -> prosody -> parameter
+# frames (TIBASE32 FUN_1c003870 and the language module's +0x04/+0x08), plus
+# the voice-expression pass. Compiles without proprietary data; the tables
+# arrive at run time as extracted .data images (tools/extract_images.py).
+# ---------------------------------------------------------------------------
+add_library(tispeech_narrate STATIC
+    src/narrate.c src/duration_eng.c src/langgen.c src/engine.c src/expression.c
+    src/textphon_eng.c)
+target_link_libraries(tispeech_narrate PUBLIC tispeech_smoothing tispeech_frames tispeech_rules)
+
 # Both test binaries run without any DLL: their fixtures are synthetic. The
 # English DLL only adds the real-inventory cases inside test_generator.c.
 add_executable(test_smoothing tests/test_smoothing.c)
@@ -108,6 +119,20 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dsp.c")
 endif()
 
 if(TISPEECH_ENG_DLL)
+    set(_eng_img "${CMAKE_CURRENT_BINARY_DIR}/eng_image.c")
+    add_custom_command(
+        OUTPUT "${_eng_img}"
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_images.py"
+                "${TISPEECH_ENG_DLL}" "${_eng_img}" --symbol sv_eng_image
+                --language --text-range 1c205fb9:1c206780
+                --text-range 1c209c20:1c249310
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_images.py"
+                "${TISPEECH_ENG_DLL}"
+        COMMENT "Extracting TIENG32 .data from ${TISPEECH_ENG_DLL}")
+    add_library(tispeech_frontend_eng STATIC "${_eng_img}")
+    target_link_libraries(tispeech_frontend_eng PUBLIC tispeech_narrate)
+
     set(_gen "${CMAKE_CURRENT_BINARY_DIR}/eng_lang_data.c")
     add_custom_command(
         OUTPUT "${_gen}"
@@ -158,6 +183,28 @@ else()
     target_link_libraries(test_generator PRIVATE tispeech_generator)
 endif()
 
+# ---------------------------------------------------------------------------
+# English synthesis data: TIBASE32's and TIENG32's .data sections whole, plus
+# the tables TIENG32 embeds in .text after its frame generator. Needs both
+# DLLs. Extracted at build time, never committed.
+# ---------------------------------------------------------------------------
+if(TISPEECH_BASE_DLL AND TISPEECH_ENG_DLL)
+    set(_base_img "${CMAKE_CURRENT_BINARY_DIR}/base_image.c")
+    add_custom_command(
+        OUTPUT "${_base_img}"
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_images.py"
+                "${TISPEECH_BASE_DLL}" "${_base_img}" --symbol sv_base_image
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_images.py"
+                "${TISPEECH_BASE_DLL}"
+        COMMENT "Extracting TIBASE32 .data from ${TISPEECH_BASE_DLL}")
+    add_library(tispeech_synth_eng STATIC "${_base_img}")
+    target_link_libraries(tispeech_synth_eng PUBLIC tispeech_narrate tispeech_base_data)
+
+    add_executable(svsay tools/svsay.c)
+    target_link_libraries(svsay PRIVATE tispeech_shared)
+endif()
+
 if(TISPEECH_SPAN_DLL)
     set(_span "${CMAKE_CURRENT_BINARY_DIR}/span_lang_data.c")
     add_custom_command(
@@ -189,7 +236,7 @@ set_target_properties(tispeech_shared PROPERTIES
 target_include_directories(tispeech_shared PUBLIC include)
 
 if(TISPEECH_ENG_DLL)
-    target_link_libraries(tispeech_shared PRIVATE tispeech_lang_eng)
+    target_link_libraries(tispeech_shared PRIVATE tispeech_lang_eng tispeech_frontend_eng)
     target_compile_definitions(tispeech_shared PRIVATE TISPEECH_HAVE_ENG=1)
 elseif(NOT TISPEECH_SPAN_DLL)
     target_link_libraries(tispeech_shared PRIVATE tispeech_rules)
@@ -198,6 +245,11 @@ endif()
 if(TISPEECH_SPAN_DLL)
     target_link_libraries(tispeech_shared PRIVATE tispeech_lang_span)
     target_compile_definitions(tispeech_shared PRIVATE TISPEECH_HAVE_SPAN=1)
+endif()
+
+if(TARGET tispeech_synth_eng)
+    target_link_libraries(tispeech_shared PRIVATE tispeech_synth_eng)
+    target_compile_definitions(tispeech_shared PRIVATE TISPEECH_HAVE_SYNTH_ENG=1)
 endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_capi.c")
@@ -212,6 +264,9 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_capi.c")
     if(TISPEECH_SPAN_DLL)
         target_link_libraries(test_capi PRIVATE tispeech_lang_span)
         target_compile_definitions(test_capi PRIVATE TISPEECH_HAVE_SPAN=1)
+    endif()
+    if(TARGET tispeech_synth_eng)
+        target_compile_definitions(test_capi PRIVATE TISPEECH_HAVE_SYNTH_ENG=1)
     endif()
     add_test(NAME capi COMMAND test_capi)
 endif()
@@ -273,5 +328,19 @@ if(TISPEECH_VERIFY_ORIGINAL)
         tispeech_oracle_library(verify_smoothing src/smoothing.c)
         tispeech_oracle_test(original_smoothing verify_smoothing.py verify_smoothing
             --dll "${TISPEECH_BASE_DLL}" --cases "${TISPEECH_VERIFY_CASES}")
+    endif()
+    if(TARGET tispeech_synth_eng)
+        # The whole narrate pipeline against the original engine run end to
+        # end under Unicorn: every stage boundary, then the PCM stream.
+        tispeech_oracle_library(verify_narrate tools/narrate_oracle.c
+            src/narrate.c src/duration_eng.c src/langgen.c src/engine.c
+            src/expression.c src/smoothing.c src/frames.c src/dsp.c
+            "${_base_img}" "${_eng_img}" "${_base}")
+        get_filename_component(_dll_dir "${TISPEECH_BASE_DLL}" DIRECTORY)
+        tispeech_oracle_test(original_voice verify_voice.py tispeech_shared
+            --dlls "${_dll_dir}")
+        tispeech_oracle_test(original_narrate verify_narrate.py verify_narrate
+            --dlls "${_dll_dir}" --pcm --words 40
+            --frontend-library "$<TARGET_FILE:tispeech_shared>")
     endif()
 endif()

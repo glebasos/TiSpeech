@@ -14,10 +14,9 @@ namespace TiSpeech;
 ///
 /// HONESTY CONTRACT (mirrors capi.h): nothing here reports success it did not
 /// earn. <see cref="Capabilities"/> is what callers gate on, not the host
-/// operating system. <see cref="Synthesize"/> returns
-/// <see cref="TiStatus.NotImplemented"/> because the phoneme-to-frame stage is
-/// not reconstructed, and this wrapper must never be changed to substitute
-/// silence, a system voice, or any other audio.
+/// operating system. English synthesis is available when both base and English
+/// data were supplied at build time. Unsupported paths return an error; no
+/// system voice or substitute audio is used.
 ///
 /// ABSENCE IS NORMAL. The native library is built from an original TIENG32.DLL
 /// that most contributors do not have, so "not loaded" is an expected steady
@@ -73,6 +72,25 @@ public static partial class TiSpeechNative
     private static unsafe partial void NativeFreeSamples(byte* samples);
 
     // ── Library resolution ────────────────────────────────────────────────────
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeVoiceOptions
+    {
+        public int Personality, Pitch, Rate, Voicing, F0Style;
+        public int F0Range, F0Perturb, VowelFactor, GlottalSource;
+
+        public NativeVoiceOptions(TiVoiceOptions o)
+        {
+            Personality = (int)o.Personality; Pitch = o.Pitch; Rate = o.Rate;
+            Voicing = o.Voicing; F0Style = o.F0Style; F0Range = o.F0Range;
+            F0Perturb = o.F0Perturb; VowelFactor = o.VowelFactor; GlottalSource = o.GlottalSource;
+        }
+    }
+
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    [LibraryImport(LibraryName, EntryPoint = "tispeech_synthesize_ex")]
+    private static unsafe partial int NativeSynthesizeEx(uint language, byte* phonemes,
+        NativeVoiceOptions* options, byte** outSamples, int* outCount, int* outSampleRate);
 
     private static readonly Lock ProbeLock = new();
     private static ImmutableArray<string> _probedPaths = [];
@@ -327,14 +345,10 @@ public static partial class TiSpeechNative
         && (Languages & (TiLanguageFlags)(uint)language) != 0;
 
     /// <summary>
-    /// Letter-to-sound conversion (<c>tispeech_text_to_phonemes</c>). This is
-    /// the one pipeline stage the reconstruction has finished, and it runs
-    /// natively on macOS, Linux and Windows alike.
-    ///
-    /// Per capi.h this covers the rules only: text normalisation (numbers,
-    /// abbreviations) and the user dictionary run ahead of this stage in the
-    /// original and are NOT reconstructed, so digits and abbreviations will not
-    /// match the original engine's output.
+    /// Text-to-phoneme conversion on macOS, Linux and Windows. English uses
+    /// the reconstructed normaliser, exception dictionary and stress rules;
+    /// Spanish currently uses letter-to-sound rules only. User dictionaries
+    /// are not supported. English accepts at most 514 Latin-1 characters.
     /// </summary>
     public static TiPhonemeResult TextToPhonemes(TiLanguage language, string text)
     {
@@ -362,6 +376,11 @@ public static partial class TiSpeechNative
                     $"The letter-to-sound tables are 8-bit and cannot represent '{c}'. " +
                     "Only Latin-1 text can be converted.");
         }
+
+        if (language == TiLanguage.English && text.Length > 514)
+            return TiPhonemeResult.Failure(TiStatus.BadParam,
+                "English conversion currently supports at most 514 characters per call. " +
+                "Split the text into shorter passages.");
 
         if (string.IsNullOrWhiteSpace(text))
             return TiPhonemeResult.Success(string.Empty);
@@ -431,19 +450,19 @@ public static partial class TiSpeechNative
     /// <summary>
     /// Phoneme-to-PCM synthesis (<c>tispeech_synthesize</c>).
     ///
-    /// This returns <see cref="TiStatus.NotImplemented"/> today and that is the
-    /// correct, intended answer: the waveform kernel is reconstructed, but the
-    /// stage that turns phonemes into the parameter frames driving it is not.
-    /// It exists so callers can link and gate against a stable signature. Do not
-    /// change it to return silence, a system voice, or any other substitute
-    /// audio — see the honesty contract in capi.h.
+    /// English synthesis uses the original default voice when base and English
+    /// data were supplied at build time. Unsupported commands and builds without
+    /// synthesis data return <see cref="TiStatus.NotImplemented"/>.
     /// </summary>
-    public static TiSynthesisResult Synthesize(TiLanguage language, string phonemes)
+    public static TiSynthesisResult Synthesize(TiLanguage language, string phonemes, TiVoiceOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(phonemes);
 
         if (!IsAvailable)
             return TiSynthesisResult.Failure(TiStatus.LibraryUnavailable);
+
+        if (phonemes.Contains('\0'))
+            return TiSynthesisResult.Failure(TiStatus.BadParam, "Phonemes cannot contain embedded NUL characters.");
 
         var utf8 = Encoding.UTF8.GetBytes(phonemes);
         var input = new byte[utf8.Length + 1];
@@ -458,7 +477,21 @@ public static partial class TiSpeechNative
             int rc;
             fixed (byte* pIn = input)
             {
-                rc = NativeSynthesize((uint)language, pIn, &samples, &count, &sampleRate);
+                try
+                {
+                    if (options is null)
+                        rc = NativeSynthesize((uint)language, pIn, &samples, &count, &sampleRate);
+                    else
+                    {
+                        var nativeOptions = new NativeVoiceOptions(options);
+                        rc = NativeSynthesizeEx((uint)language, pIn, &nativeOptions, &samples, &count, &sampleRate);
+                    }
+                }
+                catch (EntryPointNotFoundException)
+                {
+                    return TiSynthesisResult.Failure(TiStatus.NotImplemented,
+                        "Rebuild the native library to enable voice controls.");
+                }
             }
 
             var status = (TiStatus)rc;
@@ -470,10 +503,27 @@ public static partial class TiSpeechNative
                 return TiSynthesisResult.Failure(status == TiStatus.Ok ? TiStatus.NotImplemented : status);
             }
 
-            var managed = new byte[count];
-            new ReadOnlySpan<byte>(samples, count).CopyTo(managed);
-            NativeFreeSamples(samples);
-            return new TiSynthesisResult(TiStatus.Ok, managed, sampleRate);
+            try
+            {
+                var managed = new byte[count];
+                new ReadOnlySpan<byte>(samples, count).CopyTo(managed);
+                return new TiSynthesisResult(TiStatus.Ok, managed, sampleRate);
+            }
+            finally { NativeFreeSamples(samples); }
         }
     }
+    /// <summary>Convert ordinary English text and synthesize the resulting phonemes.</summary>
+    public static TiSynthesisResult SynthesizeText(TiLanguage language, string text, TiVoiceOptions? options = null)
+    {
+        if (language != TiLanguage.English)
+            return TiSynthesisResult.Failure(TiStatus.NoLanguage,
+                "Native speech currently supports English. Spanish phoneme previews remain available.");
+        var phonemes = TextToPhonemes(language, text);
+        if (!phonemes.IsSuccess)
+            return TiSynthesisResult.Failure(phonemes.Status, phonemes.Message);
+        if (string.IsNullOrWhiteSpace(phonemes.Phonemes))
+            return TiSynthesisResult.Failure(TiStatus.BadParam, "Enter some text to speak.");
+        return Synthesize(language, phonemes.Phonemes, options);
+    }
+
 }

@@ -449,6 +449,137 @@ With this pass and the interpolator done and `0x1c00df10` established as empty,
 **`0x1c00be40` is the only post-generation pass left** — roughly 490
 instructions driven by a table at `0x1c001470`.
 
+### The narrate pipeline, phoneme string to PCM — DONE, VERIFIED END TO END
+
+`SVNarrate` (`0x1c0036f0`) hands its phoneme string to `FUN_1c003870`, which
+generates **every** frame of one sentence up front and only then starts the
+incremental waveOut renderer. That whole generation half is now reconstructed,
+and so is the language module's frame generator it drives:
+
+| Stage | Original | Reconstruction |
+|---|---|---|
+| sentence chunking | `TIBASE32 0x1c00c500` | `src/narrate.c` `sv_next_sentence` |
+| phoneme-string parser | `0x1c004a10` | `parse` |
+| language/table switches | `0x1c003e40` | `apply_switches` |
+| stressed-onset marking | `0x1c00c550` | `mark_onsets` |
+| phonological rewrite rules (table `+0x24`) | `0x1c005910` + `5a00/5a60/5c00/5cb0/5d40/5cf0` | `apply_rules` |
+| phrase/word grouping | `0x1c00c6d0` | `group_words` |
+| post-pause marking | `0x1c003de0` | `mark_after_pause` |
+| intonation arrays, classification, targets | `0x1c00cc10`, `0x1c00c8c0` (5 passes), `0x1c00cdc0` (8 per-phrase passes) | `alloc_intonation`, `classify_*`, `intonation` |
+| segment durations (vtable `+0x04`) | `TIENG32 0x1c2010d0` | `src/duration_eng.c` |
+| rate and emphasis commands | `TIBASE32 0x1c00f7c0` | `rate_commands` |
+| silent-record removal, frame allocation | `0x1c00c420` | `alloc_frames` |
+| **frame generator** (vtable `+0x08`) | `TIENG32 0x1c204690` + `1b80/2030b0/249310/3ab0/4030/42c0/3a30/3770/4500..4610/203870` | `src/langgen.c` |
+| pitch interpolation, slew x2 | `0x1c00cd40`, `0x1c00de60` | `src/smoothing.c` (existing) |
+| voice expression | `0x1c00be40` | `src/expression.c` (existing, now integrated) |
+| waveOut buffering | `0x1c003870` tail, `0x1c00f4e0` | `sv_narrate_render` |
+
+**Status: sample-exact.** `tools/verify_narrate.py` runs the ORIGINAL engine
+end to end under Unicorn (`tools/sv_emu.py`: both DLLs mapped, CRT/Win32
+imports stubbed in Python, `MM_WOM_DONE` pumped back into the window
+procedure, `waveOutWrite` buffers captured), snapshots the engine at all 15
+stage boundaries inside `FUN_1c003870`, and compares the reconstruction on the
+same phoneme string at each boundary, then the whole PCM stream:
+
+```
+$ python tools/verify_narrate.py --dlls DIR --library libverify_narrate.dylib --pcm --words 400 --seed 0x5eed
+PASS: 405/405 texts match through stage 'expression'      (and PCM byte-identical)
+```
+
+One differential for the whole middle, instead of one per function: every
+stage is checked on inputs the original's previous stage actually produced
+for real text. It found every bug in this reconstruction on the first run
+that exercised it — an inverted condition encoding in the rewrite-rule
+engine, and an off-by-one record base when calling the expression pass.
+
+How `src/langgen.c` is written. The generator keeps all of its working state
+in ~200 module globals: 17 parameter tracks of 0x40 bytes, a 0x400-byte
+contour buffer and a cursor per track, a five-record window. Rather than
+invent a layout, each module instance owns a mutable copy of the module's
+`.data` and the port addresses globals by their original VA through small
+accessors (`T(F2, 0x1c)` is the dword at track F2 + 0x1c). The contour
+buffers and cursors stay 32-bit VAs inside that copy, so pointer arithmetic
+is the original's. Engine state, records and frames are native.
+
+Findings from this reconstruction:
+
+- **The 17 tracks name themselves.** Each track's `+0x00` points at a
+  two-letter string in TIENG32 `.data` (`0x1c24c0d4..0x1c24c117`): **F0 F1 F2
+  F3 B1 B2 B3 AV AF AH AK K1 Q1 TL DI MH MW** — Klatt parameter names. That
+  answers open question 6.
+- **Table `+0x24` is the phonological rewrite-rule table** (16-byte rules:
+  insert-before/replace/insert-after codes, previous/current/next match, five
+  context tests, flags), and **`+0x20` is the language's voice table** (74-byte
+  rows, like TIBASE32's at `0x1c013600`). That answers open question 4 for two
+  of the three tables.
+- **Phoneme definition fields**: `+0x06/+0x08/+0x0a` F1/F2/F3 targets,
+  `+0x0c/+0x0e/+0x10` B1/B2/B3, `+0x12/+0x14` minimum/inherent duration,
+  `+0x16` voicing level, `+0x17` glottal source. Diphthongs take their end
+  target from the following entry. (Open question 7.)
+- **Uninitialised stack reads in the original.** `0x1c2495ab` reads a stack
+  word nothing initialised; on every path it holds `FUN_1c2030b0`'s saved EBX,
+  the generator's loop constant `0x4b`, so the port uses 75. Frame bytes
+  `+0x1b..+0x1d` (event parameter and word) are copied from two locals the
+  generator only sets when a `0x334`/`0x352` command is present; otherwise
+  they carry whatever the stack held, which the differential masks when the
+  frame's event bits are clear. Five generator locals (the higher-formant
+  smoothers, the nasal B2, the event fields) are read before being written in
+  some calls and so persist across calls exactly as the stack slots do; they
+  are kept in `sv_langgen`.
+- **Dead code**: a date check against year 9999 (`0x1c004bc4`, `0x1c00d373`)
+  that can never fire; the note command `0xb4` computes and discards its
+  result in F0 mode 0 (`0x1c203b31`); `FUN_1c204680` is a bare `ret`; the
+  number-marker error test at `0x1c004dd6` masks a dword and can never match.
+- **The frame generator writes pitch into the next phoneme's frames**
+  (`0x1c204610`), which near the end of the array runs past the original's
+  allocation; the port allocates slack frames that are never read.
+
+**Not covered.** The inline `{...}` command parser (`FUN_1c005180` and its
+helpers) is not reconstructed: `sv_narrate_sentence` returns
+`SV_NAR_E_NOTIMPL` on a `{`. The event-reporting block of the renderer is
+still skipped (it does not touch audio). The generator is written against
+TIENG32 addresses; driving TISPAN32 needs a VA relocation map. The English
+duration rules (`+0x04`) are per language; Spanish's are not ported.
+
+### English text front end — integrated (2026-09-28)
+
+`src/textphon_eng.c` now builds and is used by `tispeech_text_to_phonemes`
+whenever TIENG32 data is supplied. It reconstructs TIBASE32 `SVTextToPhon`
+(`0x1c00fc50`), the `SVTTS` output-buffer retry loop (`0x1c00f970`), and
+TIENG32's word translator (`0x1c2067c0`): exception pronunciations, number
+normalisation and format handlers, letter-to-sound rules, and default stress.
+The source also contains spell mode and command passthrough; the public ABI
+currently selects the ordinary flags=0 path. User dictionaries remain absent.
+
+The English `.data` image and read-only `.text` tables are extracted even
+without TIBASE32, so text conversion does not require synthesis data. Each
+conversion owns a mutable language-state copy. Spanish retains its existing
+matcher-only path. The .NET build now supplies TIBASE32 when available, enabling
+English PCM synthesis through the managed bindings. `NativeTiSpeechBackend`
+plays it through `SystemPcmPlayer` (afplay on macOS, paplay/aplay on Linux),
+and OpenTalkIt selects it whenever the Windows host is unavailable.
+
+Validation in this session: 345 supported text inputs matched original
+`SVTextToPhon` byte for byte (dictionary sentences, numbers, currency, dates,
+phone numbers, Latin-1, whitespace and buffer-retry cases). A separate 25-text
+end-to-end run matched all existing stage snapshots and the public API's PCM
+sample for sample. The existing pipeline verifier accepts `--frontend-library`
+to include public UTF-8 text conversion and synthesis in that comparison:
+
+```sh
+python tools/verify_narrate.py --dlls /path/to/dll/dir \
+  --library build-oracle/libverify_narrate.dylib \
+  --frontend-library build-oracle/libtispeech.dylib --pcm --words 20
+```
+
+Compatibility details: original leading/repeated spaces and tab-dependent
+stress are preserved. The original returns success with empty output above
+514 input bytes; the public ABI deliberately returns `TISPEECH_E_BADPARAM`
+instead, and the managed wrapper explains the limit. UTF-8 decoding still
+rejects malformed and non-Latin-1 input. Too-small caller buffers return
+`TISPEECH_E_BUFFERFULL` with an empty result. Inline commands can be converted
+to phoneme text, but synthesis still rejects them with `NOTIMPL`.
+
 ## The language modules are one code base
 
 `TISPAN32` was examined to see what Spanish would cost, since the application
@@ -543,49 +674,48 @@ plus oracle-confirmed Spanish outputs.
    `\` terminator, `|2` for `` ` ``, `|8` when the output contains `.` or `?`.
    Bit 2 (the initial `4`) has no established meaning yet. Currently computed
    and discarded.
-4. **Tables `+0x14`, `+0x18`, `+0x24`** are unidentified.
+4. **Tables `+0x14`, `+0x18`, `+0x24`**: `+0x14`/`+0x18` are the two phoneme
+   definition tables (the second is selected by voice command `0x32` values
+   1, 3, 5, 13, 15), `+0x24` the rewrite rules, `+0x20` the voice table.
 5. **Coverage.** `TIBASE32`'s Ghidra map has large unmapped gaps
    (`0x1C0010A2`–`0x1C0036F0`, `0x1C005DE4`–`0x1C00BE40`). Those are data or
    hand-written assembly; do not assume the decompilation is complete.
-6. **What the 17 parameter tracks are.** `sv_gen_track_contour()` reproduces a
-   track's contour exactly without knowing which track is F1 and which is
-   voicing amplitude. The mapping lives in the generator driver's one-time init
-   at `0x1c2049a9`, and until it is read the reconstructed stage produces
-   correct numbers for an unnamed quantity.
+6. ~~**What the 17 parameter tracks are.**~~ **SETTLED**: the module names
+   them itself (F0 F1 F2 F3 B1 B2 B3 AV AF AH AK K1 Q1 TL DI MH MW), see the
+   narrate pipeline section.
 7. **Phoneme record fields.** `+0x04`, `+0x08`, `+0x0c`, `+0x0e` are
    established; the rest of the 26-byte record, and bytes `+0x06..+0x19` of a
    phoneme *definition* entry, are the per-phoneme parameter targets and are
    unread by anything reconstructed so far.
-8. **The last post-generation pass.** `0x1c00be40`, ~490 instructions over a
-   table at `0x1c001470`, is the only one of the five calls at `0x1c0039ec`
-   still unreconstructed: `0x1c00cd40` and `0x1c00de60` are done and
-   `0x1c00df10` turned out to be a bare `retl`.
+8. ~~**The last post-generation pass.**~~ `0x1c00be40` is the voice-expression
+   pass (`src/expression.c`) and is integrated and verified in the pipeline.
+
+9. **Speaking mode.** `SVSetSpeakingMode` (`0x1c00ecd0`) returns `0x1b62`
+   unless `value & 7` is non-zero, then only tests bit `0x2`: set → `handle+0xcc
+   |= 0x10`, clear → `&= ~0x10`. So the managed `TiSpeakingMode.Natural = 0`
+   would be *rejected* by the original; 1 behaves as natural, 2/3 as spell.
+   SVTTS takes its own spell flag (`4`) from its caller, not from the handle.
+   No `testb $0x10` on `+0xcc` exists in either DLL; the only candidate reader
+   is `0x1c00df33`, which copies `handle+0xcc` into narrate state `+0x4e`.
+   Unresolved; the native backend still rejects non-natural modes with NOTIMPL.
 
 ## Not started
 
-Text normalisation (numbers, abbreviations), the user dictionary, the
-generator driver at `0x1C204690` that would turn the reconstructed leaves into
-actual parameter frames, the last post-generation pass (`0x1c00be40`), and the
-whole `TIBASE32` public API beyond its declared surface.
-
-The pipeline now has working ends and a missing middle:
+The user dictionary, the inline-command parser, Spanish's duration rules and
+generator relocation, and the `TIBASE32` public API beyond its declared
+surface.
 
 | Stage | Status |
 |---|---|
-| text → phonemes | matcher reconstructed and verified bit-exact (`src/ruleset.c`), English and Spanish; full front ends still missing |
-| phonemes → parameter frames | **the missing middle.** Two leaf stages reconstructed and verified bit-exact (`src/generator.c`), plus both pitch passes (`src/smoothing.c`); the 6.4 KB driver at `0x1C204690` and one post-generation pass (`0x1c00be40`) are not started |
+| text → phonemes | English front end integrated (`src/textphon_eng.c`), including normalisation, exceptions, numbers and stress; Spanish matcher only |
+| phonemes → parameter frames | **reconstructed and verified sample-exact end to end** (`src/narrate.c`, `src/duration_eng.c`, `src/langgen.c`), English |
 | parameter frames → PCM | reconstructed and verified bit-exact (`src/frames.c`, `src/dsp.c`) |
-| PCM → audio device | not started |
+| PCM → audio device | managed side: `SystemPcmPlayer` via `NativeTiSpeechBackend` (the original's waveOut layer is not reconstructed) |
 
-The missing middle has a name: it is the language module's vtable slot `+0x08`,
-driven by `TIBASE32!FUN_1c005840`. The frame stage below it *consumes* frames;
-nothing yet *produces* them. Two of its leaves and the first pass that runs
-after it are now reconstructed and verified (see above), which establishes the
-data shapes it works in — 26-byte phoneme records, 17 parameter tracks, a 9×16
-interpolation-rate table — without yet producing a single frame.
-
-Until the middle stage lands, `tispeech_synthesize()` in `src/capi.c` returns
-`TISPEECH_E_NOTIMPL` and the application keeps Talk disabled off Windows.
+`tispeech_synthesize()` in `src/capi.c` now works: a SoftVoice phoneme string
+in, the original's exact 8-bit 11025 Hz PCM stream out, and
+`tispeech_capabilities()` reports `TISPEECH_CAP_SYNTHESIS` when the build has
+both TIBASE32 and TIENG32. `tools/svsay` writes it to a WAV file.
 
 ## Tooling
 
@@ -632,9 +762,10 @@ what gets built:
 | Set | Adds |
 |---|---|
 | none | rule engine, DSP, frame renderer, generator stages, pitch smoothing, shared library; `capi`, `generator` and `smoothing` tests (their fixtures are synthetic) |
-| `TISPEECH_ENG_DLL` | English rule data, English generator tables, `svphon`, `ruleset` test, the real-inventory cases in the `generator` test |
+| `TISPEECH_ENG_DLL` | English front-end images, rule data, generator tables, `svphon`, `ruleset` test, real-inventory generator tests |
 | `TISPEECH_SPAN_DLL` | Spanish rule data and Spanish ABI checks in `capi` |
 | `TISPEECH_BASE_DLL` | base coefficient tables, `frames` test |
+| `TISPEECH_BASE_DLL` + `TISPEECH_ENG_DLL` | English synthesis data (`.data` images), `tispeech_synthesize`, `svsay` |
 
 The library code always compiles without any DLLs: callers supply the tables at
 the C boundary. Only the generated data libraries and the tests that need them
@@ -647,9 +778,9 @@ only what the reconstruction has actually finished. `tispeech_capabilities()`
 reports that, so the application gates on real capability rather than on the
 host operating system.
 
-The C ABI takes UTF-8 restricted to Latin-1. It decodes that UTF-8 to the
-matcher's single-byte character set and upper-cases Latin-1 letters without
-using the process locale. Malformed UTF-8 and characters outside Latin-1 are
+The C ABI takes UTF-8 restricted to Latin-1. It decodes UTF-8 to the
+engine's single-byte character set. English uses original normalisation;
+Spanish upper-cases Latin-1 letters without using the process locale. Malformed UTF-8 and characters outside Latin-1 are
 rejected, not passed through as unrelated rule-table indices. Managed callers
 also reject embedded NULs rather than silently converting only a prefix.
 `test_capi` covers this boundary against the raw matcher and runs even without
@@ -703,6 +834,15 @@ cc -shared -fPIC -std=c11 -Wall -Wextra -Wconversion -Iinclude \
    src/smoothing.c -o build/libsmoothing.dylib
 python tools/verify_smoothing.py --dll /path/to/TIBASE32.DLL \
        --library build/libsmoothing.dylib --cases 20000
+```
+
+The whole narrate pipeline, against the original engine run end to end
+(`--pcm` also compares the rendered audio; `--words N` adds random
+dictionary sentences; `--stage` stops at an earlier boundary):
+
+```sh
+python tools/verify_narrate.py --dlls /path/to/dll/dir \
+       --library build-oracle/libverify_narrate.dylib --pcm --words 400
 ```
 
 `verify_smoothing.py` takes `--stage interpolate|slew|all`, and

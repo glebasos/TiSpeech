@@ -2,13 +2,14 @@
  * capi.c — implementation of the managed-facing ABI declared in capi.h.
  *
  * This file contains no reconstructed SoftVoice logic. It is glue: it reports
- * what the build actually contains and forwards the one pipeline stage that is
- * finished (letter-to-sound) to src/ruleset.c. Stages that are not
+ * what the build actually contains and forwards text conversion and synthesis
+ * to the reconstructed engine. Stages that are not
  * reconstructed return TISPEECH_E_NOTIMPL here and are not emulated, faked or
  * substituted.
  */
 
 #include "tispeech/capi.h"
+#include "tispeech/narrate.h"
 #include "tispeech/ruleset.h"
 
 #include <stdlib.h>
@@ -31,8 +32,11 @@ uint32_t tispeech_capabilities(void)
     uint32_t caps = 0;
     if (TISPEECH_LANGS_BUILT != 0)
         caps |= TISPEECH_CAP_TEXT_TO_PHONEMES;
-    /* TISPEECH_CAP_SYNTHESIS is deliberately never set: the phoneme-to-frame
-     * stage is not reconstructed. See tispeech_synthesize(). */
+#ifdef TISPEECH_HAVE_SYNTH_ENG
+    /* Phoneme string -> PCM, verified sample-exact against the original
+     * engine (tools/verify_narrate.py). English only. */
+    caps |= TISPEECH_CAP_SYNTHESIS;
+#endif
     return caps;
 }
 
@@ -41,20 +45,26 @@ uint32_t tispeech_languages(void)
     return (uint32_t)TISPEECH_LANGS_BUILT;
 }
 
+#ifdef TISPEECH_HAVE_SYNTH_ENG
+#  define SYNTH_INFO "synthesis: English"
+#else
+#  define SYNTH_INFO "synthesis: not built (needs TIBASE32 and TIENG32)"
+#endif
+
 const char *tispeech_build_info(void)
 {
 #if defined(TISPEECH_HAVE_ENG) && defined(TISPEECH_HAVE_SPAN)
-    return "tispeech native reconstruction; letter-to-sound: English, Spanish; "
-           "synthesis: not implemented";
+    return "tispeech native reconstruction; text front end: English; letter-to-sound: Spanish; "
+           SYNTH_INFO;
 #elif defined(TISPEECH_HAVE_ENG)
-    return "tispeech native reconstruction; letter-to-sound: English; "
-           "synthesis: not implemented";
+    return "tispeech native reconstruction; text front end: English; "
+           SYNTH_INFO;
 #elif defined(TISPEECH_HAVE_SPAN)
     return "tispeech native reconstruction; letter-to-sound: Spanish; "
-           "synthesis: not implemented";
+           SYNTH_INFO;
 #else
     return "tispeech native reconstruction; letter-to-sound: no language data "
-           "compiled in; synthesis: not implemented";
+           "compiled in; " SYNTH_INFO;
 #endif
 }
 
@@ -72,14 +82,13 @@ static const sv_ruleset_t *ruleset_for(uint32_t language)
     return NULL;
 }
 
-/* Decode the ABI's UTF-8 into the matcher's Latin-1 bytes, upper-case them,
- * and add word boundaries. This is boundary glue, not the original engine's
- * number/abbreviation normaliser. Case conversion is locale-independent. */
-static int32_t normalise(const char *text, char **out)
+/* Decode UTF-8 to Latin-1. The English front end owns normalisation; the
+ * Spanish matcher still needs upper-casing and word boundaries here. */
+static int32_t normalise(const char *text, char **out, int frontend)
 {
     size_t n = strlen(text);
     char *buf;
-    size_t i = 0, used = 1;
+    size_t i = 0, used = frontend ? 0 : 1;
 
     if (n > SIZE_MAX - 3)
         return TISPEECH_E_OUTOFMEMORY;
@@ -104,17 +113,56 @@ static int32_t normalise(const char *text, char **out)
             }
             c = (unsigned char)(((c & 3u) << 6) | (next & 0x3fu));
         }
+        if (frontend) {
+            buf[used++] = (char)c;
+            continue;
+        }
         if ((c >= 'a' && c <= 'z') || (c >= 0xe0 && c <= 0xf6)
             || (c >= 0xf8 && c <= 0xfe))
             c -= 0x20;
         /* Treat control characters and non-breaking spaces as separators. */
         buf[used++] = (c < 0x20 || (c >= 0x7f && c <= 0xa0)) ? ' ' : (char)c;
     }
-    buf[used++] = ' ';
+    if (!frontend)
+        buf[used++] = ' ';
     buf[used] = '\0';
     *out = buf;
     return TISPEECH_OK;
 }
+
+#ifdef TISPEECH_HAVE_ENG
+extern const uint8_t sv_eng_image[];
+extern const uint32_t sv_eng_image_va, sv_eng_image_size;
+extern const uint32_t sv_eng_image_desc[10];
+extern const sv_image sv_eng_image_text[];
+extern const size_t sv_eng_image_text_count;
+
+static int32_t text_to_phonemes_eng(const char *text, char *out, int32_t size)
+{
+    /* SVTextToPhon silently emits nothing above 0x202 input bytes. Expose
+     * an explicit limit rather than reporting a successful empty conversion. */
+    if (strlen(text) > 0x202)
+        return TISPEECH_E_BADPARAM;
+    sv_image li = {sv_eng_image, sv_eng_image_va, sv_eng_image_size};
+    sv_langmod eng = {0};
+    char *phonemes = NULL;
+    if (sv_langmod_init(&eng, &li, sv_eng_image_desc))
+        return TISPEECH_E_NOLANGUAGE;
+    if (sv_langgen_attach(&eng, &li, sv_eng_image_text, sv_eng_image_text_count))
+        return TISPEECH_E_OUTOFMEMORY;
+    int32_t rc = sv_tts_phonemes(&eng, text, 0, &phonemes);
+    sv_langgen_detach(&eng);
+    if (rc == 0) {
+        size_t n = strlen(phonemes);
+        if (n >= (size_t)size)
+            rc = TISPEECH_E_BUFFERFULL;
+        else
+            memcpy(out, phonemes, n + 1);
+    }
+    free(phonemes);
+    return rc;
+}
+#endif
 
 int32_t tispeech_text_to_phonemes(uint32_t language, const char *text,
                                   char *out, int32_t out_size)
@@ -135,9 +183,17 @@ int32_t tispeech_text_to_phonemes(uint32_t language, const char *text,
     if (rules == NULL)
         return TISPEECH_E_NOLANGUAGE;
 
-    status = normalise(text, &work);
+    status = normalise(text, &work, language == TISPEECH_LANG_ENGLISH);
     if (status != TISPEECH_OK)
         return status;
+
+#ifdef TISPEECH_HAVE_ENG
+    if (language == TISPEECH_LANG_ENGLISH) {
+        status = text_to_phonemes_eng(work, out, out_size);
+        free(work);
+        return status;
+    }
+#endif
 
     /* One call per word: the matcher stops at a space by design, so the caller
      * owns word iteration (the original front end does the same). */
@@ -180,21 +236,183 @@ int32_t tispeech_text_to_phonemes(uint32_t language, const char *text,
     return status;
 }
 
+#ifdef TISPEECH_HAVE_SYNTH_ENG
+extern const uint8_t sv_base_image[];
+extern const uint32_t sv_base_image_va, sv_base_image_size;
+extern const sv_frame_tables sv_base_tables;
+extern const sv_expr_tables sv_base_tables_expression;
+
+struct pcm_buffer {
+    uint8_t *data;
+    size_t n, cap;
+    int failed;
+};
+
+static void pcm_append(void *ctx, const uint8_t *pcm, size_t n)
+{
+    struct pcm_buffer *b = ctx;
+    if (b->failed)
+        return;
+    if (b->n + n > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 0x10000;
+        while (cap < b->n + n)
+            cap *= 2;
+        uint8_t *d = realloc(b->data, cap);
+        if (!d) {
+            b->failed = 1;
+            return;
+        }
+        b->data = d;
+        b->cap = cap;
+    }
+    memcpy(b->data + b->n, pcm, n);
+    b->n += n;
+}
+
+static int32_t narrate_status(int rc)
+{
+    switch (rc) {
+    case SV_NAR_E_PHONEME:
+    case SV_NAR_E_COMMAND: return TISPEECH_E_BADPARAM;
+    case SV_NAR_E_NOMEM: return TISPEECH_E_OUTOFMEMORY;
+    default: return TISPEECH_E_NOTIMPL;
+    }
+}
+
+/* One utterance on a fresh engine: SVOpenSpeech's defaults (voice row 0,
+ * English, the primary phoneme table) and SVNarrate's sentence loop. */
+static int32_t synthesize_eng(const char *phonemes, const tispeech_voice_options *options,
+                              struct pcm_buffer *out)
+{
+    sv_image bi = {sv_base_image, sv_base_image_va, sv_base_image_size};
+    sv_image li = {sv_eng_image, sv_eng_image_va, sv_eng_image_size};
+    sv_nar_tables tables;
+    sv_langmod eng;
+    sv_engine *e = calloc(1, sizeof *e);
+    int32_t status = TISPEECH_OK;
+    memset(&eng, 0, sizeof eng);
+    if (!e)
+        return TISPEECH_E_OUTOFMEMORY;
+    if (sv_nar_tables_init(&tables, &bi) || sv_langmod_init(&eng, &li, sv_eng_image_desc)) {
+        free(e);
+        return TISPEECH_E_NOLANGUAGE;
+    }
+    eng.duration = sv_eng_duration;
+    if (sv_langgen_attach(&eng, &li, sv_eng_image_text, sv_eng_image_text_count)) {
+        free(e);
+        return TISPEECH_E_OUTOFMEMORY;
+    }
+    e->base = &tables;
+    e->frame_tables = &sv_base_tables;
+    e->expr_tables = &sv_base_tables_expression;
+    e->modules[0] = &eng;
+    e->lang = &eng;
+    e->lang_primary = &eng;
+    e->phonemes = eng.phonemes_a;
+    unsigned row = options ? (unsigned)options->personality : 0;
+    sv_voice_load(e, tables.voices, row);
+    /* SVSetPersonality, TIBASE32 0x1c00ec30, switch at 0x1c00ec78.
+     * Only these four personalities select the alternate phoneme table. */
+    if (row == 1 || row == 5 || row == 13 || row == 15)
+        e->phonemes = eng.phonemes_b;
+    if (options) {
+        /* Original setters write handle+0xd0's voice block. Addresses:
+         * rate e950, pitch e9a0, glottal ea30, F0 style ea70, perturb eab0,
+         * range eaf0, vowel ebc0, voicing ebf0 (all TIBASE32 0x1c00xxxx). */
+#define SET_VOICE(field, offset) \
+        if (options->field >= 0) e->voice[(offset) / 2] = (uint16_t)options->field
+        SET_VOICE(pitch, 0x04); SET_VOICE(rate, 0x06);
+        SET_VOICE(glottal_source, 0x0a); SET_VOICE(voicing, 0x0c);
+        SET_VOICE(f0_style, 0x10); SET_VOICE(f0_range, 0x12);
+        SET_VOICE(f0_perturb, 0x14); SET_VOICE(vowel_factor, 0x22);
+#undef SET_VOICE
+    }
+    sv_narrate_begin(e, phonemes, 0);
+    for (;;) {
+        int rc = sv_narrate_sentence(e, 0);
+        if (rc == SV_NAR_DONE)
+            break;
+        if (rc != SV_NAR_OK) {
+            status = narrate_status(rc);
+            break;
+        }
+        if (sv_narrate_render(e, pcm_append, out) != 0) {
+            status = TISPEECH_E_NOTIMPL;
+            break;
+        }
+        if (out->failed) {
+            status = TISPEECH_E_OUTOFMEMORY;
+            break;
+        }
+    }
+    sv_narrate_free(e);
+    sv_langgen_detach(&eng);
+    free(e);
+    return status;
+}
+#endif
+
 int32_t tispeech_synthesize(uint32_t language, const char *phonemes,
                             uint8_t **out_samples, int32_t *out_count,
                             int32_t *out_sample_rate)
 {
-    (void)language;
-    (void)phonemes;
-    /* Report nothing rather than an empty-but-plausible buffer: a caller that
-     * ignores the status code must not mistake this for silence it can play. */
+    return tispeech_synthesize_ex(language, phonemes, NULL, out_samples,
+                                 out_count, out_sample_rate);
+}
+
+static int valid_override(int32_t value, int32_t lo, int32_t hi)
+{
+    return value == -1 || (value >= lo && value <= hi);
+}
+
+int32_t tispeech_synthesize_ex(uint32_t language, const char *phonemes,
+    const tispeech_voice_options *options, uint8_t **out_samples,
+    int32_t *out_count, int32_t *out_sample_rate)
+{
+    /* Report nothing rather than an empty-but-plausible buffer on any
+     * failure: a caller that ignores the status must not mistake it for
+     * silence it can play. */
     if (out_samples != NULL)
         *out_samples = NULL;
     if (out_count != NULL)
         *out_count = 0;
     if (out_sample_rate != NULL)
         *out_sample_rate = 0;
+    if (phonemes == NULL)
+        return TISPEECH_E_NULLTEXT;
+    if (out_samples == NULL || out_count == NULL || out_sample_rate == NULL)
+        return TISPEECH_E_BADPARAM;
+    if (options && (options->personality < 0 || options->personality > 19
+        || !valid_override(options->pitch, 10, 2000)
+        || !valid_override(options->rate, 20, 500)
+        || !valid_override(options->voicing, 0, 2)
+        || !valid_override(options->f0_style, 0, 4)
+        || !valid_override(options->f0_range, 0, 500)
+        || !valid_override(options->f0_perturb, 0, 500)
+        || !valid_override(options->vowel_factor, 0, 65535)
+        || !valid_override(options->glottal_source, 0, 8)))
+        return TISPEECH_E_BADPARAM;
+#ifdef TISPEECH_HAVE_SYNTH_ENG
+    if (language != TISPEECH_LANG_ENGLISH)
+        return TISPEECH_E_NOLANGUAGE;
+    /* The phoneme alphabet is 7-bit. */
+    for (const char *p = phonemes; *p; p++)
+        if ((unsigned char)*p >= 0x80)
+            return TISPEECH_E_BADPARAM;
+    struct pcm_buffer b = {NULL, 0, 0, 0};
+    int32_t status = synthesize_eng(phonemes, options, &b);
+    if (status != TISPEECH_OK || b.n > INT32_MAX) {
+        free(b.data);
+        return status != TISPEECH_OK ? status : TISPEECH_E_OUTOFMEMORY;
+    }
+    *out_samples = b.data;
+    *out_count = (int32_t)b.n;
+    *out_sample_rate = 11025;
+    return TISPEECH_OK;
+#else
+    (void)language;
     return TISPEECH_E_NOTIMPL;
+#endif
 }
 
 void tispeech_free_samples(uint8_t *samples)
