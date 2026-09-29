@@ -49,6 +49,24 @@ public interface ITiPhonemeProvider
 }
 
 /// <summary>
+/// A backend that reports the engine's word, syllable and mouth-shape events
+/// while it speaks, timed to the audio. Optional, like <see cref="ITiPcmRenderer"/>:
+/// test for it with <c>backend is ITiSpeechEventSource</c>.
+/// </summary>
+public interface ITiSpeechEventSource
+{
+    /// <summary>Which events <see cref="SpeechEvent"/> raises for speech started after it is set.</summary>
+    TiSpeechEventMask RequestedEvents { get; set; }
+
+    /// <summary>
+    /// Raised as playback reaches each event. For <see cref="TiSpeechEventKind.Word"/> the
+    /// value is the word's index in the text passed to <c>Speak</c>. Raised on a
+    /// background thread; never after that utterance's <c>SpeakCompleted</c>.
+    /// </summary>
+    event EventHandler<TiSpeechEvent>? SpeechEvent;
+}
+
+/// <summary>
 /// The speech-engine contract shared by every backend OpenTalkIt can talk to:
 /// the Windows out-of-process SoftVoice host (<c>TiSpeechClient</c>) and the
 /// portable native reconstruction (<see cref="NativeTiSpeechBackend"/>).

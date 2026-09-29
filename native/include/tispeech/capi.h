@@ -119,6 +119,29 @@ TISPEECH_API int32_t tispeech_text_to_phonemes_ex(uint32_t language,
                                                   char *out, int32_t out_size);
 
 /*
+ * SVTextToPhon's flag 8: put "@w<offset>" before each word, where <offset> is
+ * the word's index in `text` counted in decoded Latin-1 characters (so, since
+ * only Latin-1 is accepted, in UTF-16 code units too). Synthesis turns each
+ * mark into a TISPEECH_EVENT_WORD carrying that offset. The original's audio
+ * is identical with and without the marks.
+ */
+#define TISPEECH_TEXT_WORD_MARKS 0x8u
+
+/*
+ * As tispeech_text_to_phonemes_ex(), with SVTextToPhon flags (only
+ * TISPEECH_TEXT_WORD_MARKS). With word marks the text is converted in one
+ * SVTextToPhon call, grown until it fits, rather than through SVTTS's chunk
+ * loop: the original restarts offsets at each chunk and can drop a word at a
+ * seam (REVERSING.md, "Spanish numbers"). Needs a language's full front end;
+ * a matcher-only build returns TISPEECH_E_NOTIMPL for a nonzero `flags`.
+ */
+TISPEECH_API int32_t tispeech_text_to_phonemes_flags(uint32_t language,
+                                                     const char *text,
+                                                     const tispeech_userdict *dict,
+                                                     uint32_t flags,
+                                                     char *out, int32_t out_size);
+
+/*
  * Phoneme-to-PCM synthesis: SVNarrate's pipeline, reconstructed. `phonemes`
  * is a SoftVoice phoneme string (the alphabet SVTextToPhon produces, e.g.
  * " /HEH5LOW WER5LD"). The output is unsigned 8-bit mono PCM at
@@ -158,6 +181,49 @@ TISPEECH_API int32_t tispeech_synthesize_ex(uint32_t language,
     uint8_t **out_samples, int32_t *out_count, int32_t *out_sample_rate);
 
 TISPEECH_API void tispeech_free_samples(uint8_t *samples);
+
+/*
+ * Events: what the original's renderer reports while it speaks
+ * (TIBASE32 0x1c004543..0x1c004605), which it posts to the application window
+ * as the audio plays. Here each carries the sample it belongs to, so a player
+ * can raise it at the right moment.
+ */
+#define TISPEECH_EVENT_WORD      0x3ebu /* an @w mark or {wordsync n}: value = offset / n */
+#define TISPEECH_EVENT_SENTENCE  0x3ecu /* first phoneme after a pause */
+#define TISPEECH_EVENT_SYLLABLE  0x3edu /* syllable start */
+#define TISPEECH_EVENT_PHONEME   0x3eeu /* phoneme start: value = phoneme code */
+#define TISPEECH_EVENT_USYNC     0x3efu /* {usync n}: value = n & 0xff */
+#define TISPEECH_EVENT_MOUTH     0x3f0u /* mouth shape changed: value = shape, 1..10 */
+
+/* Which optional events to report (SVNarrate's flags 1/2/4/8). Word and
+ * usync events need no enable bit; they come from the phoneme string. For
+ * the sentence and syllable events the original's value is whatever the
+ * report before it left behind, and is reproduced as such. */
+#define TISPEECH_EVENTS_SENTENCE 0x1u
+#define TISPEECH_EVENTS_SYLLABLE 0x2u
+#define TISPEECH_EVENTS_PHONEME  0x4u
+#define TISPEECH_EVENTS_MOUTH    0x8u
+
+typedef struct tispeech_event {
+    int32_t sample;   /* index in the returned PCM where it takes effect */
+    int32_t time_ms;  /* the original's own timestamp: ms since the sentence began */
+    uint16_t code;    /* TISPEECH_EVENT_* */
+    uint16_t value;
+} tispeech_event;
+
+/*
+ * tispeech_synthesize_ex() that also returns the events, in order, as an
+ * array the caller releases with tispeech_free_events() (NULL when there
+ * are none). `events` is a mask of TISPEECH_EVENTS_*; other bits are
+ * TISPEECH_E_BADPARAM. The PCM is identical to tispeech_synthesize_ex()'s.
+ * Verified event for event against the original (verify_narrate.py --events).
+ */
+TISPEECH_API int32_t tispeech_synthesize_events(uint32_t language,
+    const char *phonemes, const tispeech_voice_options *options, uint32_t events,
+    uint8_t **out_samples, int32_t *out_count, int32_t *out_sample_rate,
+    tispeech_event **out_events, int32_t *out_event_count);
+
+TISPEECH_API void tispeech_free_events(tispeech_event *events);
 
 #ifdef __cplusplus
 }

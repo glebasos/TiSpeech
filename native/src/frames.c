@@ -186,6 +186,42 @@ static int frame_in_range(const sv_frame *f)
     return 1;
 }
 
+/* 0x1c004543..0x1c004605: each report is `push ecx; push cx; push code;
+ * call 0x1c00498f`, and CX is loaded only by the tests that have a value of
+ * their own. 0x3ed and 0x3ec therefore report whatever was loaded last --
+ * the marker, the mouth shape (loaded before its compare, so even when
+ * unchanged), or the 0 from 0x1c004543. ECX's high half is 0 throughout, so
+ * the queue record's dword value (+0x0c) equals its word value (+0x0a). */
+static void report_events(sv_frame_state *s, const sv_frame *f)
+{
+    uint16_t cx = 0; /* 0x1c004543: xor ecx,ecx */
+#define REPORT(code) do { if (s->on_event) s->on_event(s->event_ctx, s, (code), cx); } while (0)
+    if (s->flags & SV_FRAME_FLAG_MOUTH) {
+        cx = f->phoneme_id; /* 0x1c00454e */
+        if ((uint8_t)cx != s->last_phoneme) {
+            s->last_phoneme = (uint8_t)cx; /* 0x1c00455b */
+            REPORT(SV_EVENT_MOUTH);
+        }
+    }
+    if ((s->flags & SV_FRAME_FLAG_PHONEME) && (f->events & 0x01)) { /* 0x1c004571 */
+        cx = f->marker;
+        REPORT(SV_EVENT_PHONEME);
+    }
+    if ((s->flags & SV_FRAME_FLAG_SYLLABLE) && (f->events & 0x04)) /* 0x1c004595 */
+        REPORT(SV_EVENT_SYLLABLE);
+    if ((s->flags & SV_FRAME_FLAG_SENTENCE) && (f->events & 0x02)) /* 0x1c0045b4 */
+        REPORT(SV_EVENT_SENTENCE);
+    if (f->events & 0x08) { /* 0x1c0045d3 */
+        cx = f->event_param;
+        REPORT(SV_EVENT_USYNC);
+    }
+    if (f->events & 0x20) { /* 0x1c0045ee */
+        cx = f->event_word;
+        REPORT(SV_EVENT_WORD);
+    }
+#undef REPORT
+}
+
 int sv_frame_apply(sv_frame_state *s, const sv_frame_tables *t,
                    const sv_frame *frames)
 {
@@ -198,12 +234,6 @@ int sv_frame_apply(sv_frame_state *s, const sv_frame_tables *t,
     unsigned row;
     uint16_t elapsed_step;
 
-    if ((s->flags & SV_FRAME_FLAG_NO_EVENTS) == 0) {
-        /* 0x1c004536..0x1c004605 report frame events through FUN_1c00498f.
-         * That block runs only when flags bit 6 is clear and is not
-         * reconstructed; refusing is better than dropping the events. */
-        return SV_FRAMES_E_EVENTS;
-    }
     if (f->formant_freq[0] == SV_FRAME_END) { /* 0x1c0044d5 */
         return SV_FRAMES_END;
     }
@@ -227,6 +257,10 @@ int sv_frame_apply(sv_frame_state *s, const sv_frame_tables *t,
         return SV_FRAMES_E_LENGTH;
     }
     s->interp_scale = (int16_t)(0x10000 / (int32_t)(int16_t)s->frame_length);
+
+    if (!(s->flags & SV_FRAME_FLAG_NO_EVENTS)) { /* 0x1c004536 */
+        report_events(s, f);
+    }
 
     /* 0x1c004609: elapsed += 64000 * frame_length / rate, sign-extended
      * from AX. The `div` faults if the quotient will not fit in AX, which for
@@ -408,9 +442,6 @@ int sv_frame_render(sv_frame_state *s, const sv_frame_tables *t,
      * write it as structured C without changing the order of the counters. */
     enum { RESUME_TICK, LOAD_FRAME, SAMPLE } next;
 
-    if ((s->flags & SV_FRAME_FLAG_NO_EVENTS) == 0) {
-        return SV_FRAMES_E_EVENTS;
-    }
     if (count == 0) {
         /* The original's `dec word [ebx+0x2f4]` at 0x1c004493 wraps a zero
          * count to 0xffff and writes 65536 samples into the caller's buffer.

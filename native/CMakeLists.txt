@@ -419,6 +419,11 @@ if(TISPEECH_VERIFY_ORIGINAL)
         tispeech_oracle_test(original_narrate verify_narrate.py verify_narrate
             --dlls "${_dll_dir}" --pcm --words 40
             --frontend-library "$<TARGET_FILE:tispeech_shared>")
+        # Renderer events (word marks, syncs, mouth shapes) against the
+        # original's own queue calls, 0x1c00498f.
+        tispeech_oracle_test(original_events verify_narrate.py verify_narrate
+            --dlls "${_dll_dir}" --events --words 10
+            --frontend-library "$<TARGET_FILE:tispeech_shared>")
 
         # User dictionary (src/userdict.c): its own small oracle, since the
         # public tispeech_text_to_phonemes() (capi.c) doesn't take one.
@@ -461,5 +466,9 @@ if(TISPEECH_VERIFY_ORIGINAL)
         tispeech_oracle_test(original_narrate_span_voices verify_spanish.py verify_frontend_span
             --dlls "${_dll_dir}" --narrate-library "$<TARGET_FILE:verify_narrate_span>"
             --voices)
+        tispeech_oracle_test(original_events_span verify_spanish.py verify_frontend_span
+            --dlls "${_dll_dir}" --narrate-library "$<TARGET_FILE:verify_narrate_span>"
+            --public-library "$<TARGET_FILE:tispeech_shared>"
+            --events --numbers 10 --random 10)
     endif()
 endif()

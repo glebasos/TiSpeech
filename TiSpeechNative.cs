@@ -109,6 +109,32 @@ public static partial class TiSpeechNative
     private static unsafe partial int NativeSynthesizeEx(uint language, byte* phonemes,
         NativeVoiceOptions* options, byte** outSamples, int* outCount, int* outSampleRate);
 
+    /// <summary>capi.h <c>tispeech_event</c>.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeEvent
+    {
+        public int Sample, TimeMs;
+        public ushort Code, Value;
+    }
+
+    /// <summary>capi.h <c>TISPEECH_TEXT_WORD_MARKS</c>.</summary>
+    private const uint TextWordMarks = 0x8;
+
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    [LibraryImport(LibraryName, EntryPoint = "tispeech_text_to_phonemes_flags")]
+    private static unsafe partial int NativeTextToPhonemesFlags(uint language, byte* text, IntPtr dict,
+        uint flags, byte* output, int outputSize);
+
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    [LibraryImport(LibraryName, EntryPoint = "tispeech_synthesize_events")]
+    private static unsafe partial int NativeSynthesizeEvents(uint language, byte* phonemes,
+        NativeVoiceOptions* options, uint events, byte** outSamples, int* outCount, int* outSampleRate,
+        NativeEvent** outEvents, int* outEventCount);
+
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    [LibraryImport(LibraryName, EntryPoint = "tispeech_free_events")]
+    private static unsafe partial void NativeFreeEvents(NativeEvent* events);
+
     private static readonly Lock ProbeLock = new();
     private static ImmutableArray<string> _probedPaths = [];
     private static string? _resolvedPath;
@@ -138,7 +164,9 @@ public static partial class TiSpeechNative
     /// </summary>
     private static string[] FileNames()
     {
-        if (OperatingSystem.IsWindows())  return ["tispeech.dll", "libtispeech.dll"];
+        // libtispeech.dll first: Windows file names are case-insensitive, so
+        // "tispeech.dll" beside the app is the managed TiSpeech.dll itself.
+        if (OperatingSystem.IsWindows())  return ["libtispeech.dll", "tispeech.dll"];
         if (OperatingSystem.IsMacOS())    return ["libtispeech.dylib", "tispeech.dylib"];
         return ["libtispeech.so", "tispeech.so"];
     }
@@ -383,7 +411,15 @@ public static partial class TiSpeechNative
     /// SVTextToPhon does. At most 514 Latin-1 characters per call.
     /// </summary>
     public static TiPhonemeResult TextToPhonemes(TiLanguage language, string text,
-        TiUserDictionary? dictionary = null)
+        TiUserDictionary? dictionary = null) => TextToPhonemes(language, text, dictionary, wordMarks: false);
+
+    /// <summary>
+    /// As <see cref="TextToPhonemes(TiLanguage, string, TiUserDictionary?)"/>; with
+    /// <paramref name="wordMarks"/> each word is preceded by <c>@w</c> and its index in
+    /// <paramref name="text"/>, which synthesis reports as <see cref="TiSpeechEventKind.Word"/>.
+    /// </summary>
+    public static TiPhonemeResult TextToPhonemes(TiLanguage language, string text,
+        TiUserDictionary? dictionary, bool wordMarks)
     {
         ArgumentNullException.ThrowIfNull(text);
 
@@ -433,7 +469,30 @@ public static partial class TiSpeechNative
         {
             var output = new byte[size];
             int rc;
-            if (dictionary is null)
+            if (wordMarks)
+            {
+                try
+                {
+                    rc = dictionary is null ? Convert(IntPtr.Zero) : dictionary.Use(Convert);
+                }
+                catch (EntryPointNotFoundException)
+                {
+                    return TiPhonemeResult.Failure(TiStatus.NotImplemented,
+                        "Rebuild the native library to enable speech events.");
+                }
+
+                int Convert(IntPtr dict)
+                {
+                    unsafe
+                    {
+                        fixed (byte* pIn = input)
+                        fixed (byte* pOut = output)
+                            return NativeTextToPhonemesFlags((uint)language, pIn, dict, TextWordMarks,
+                                pOut, output.Length);
+                    }
+                }
+            }
+            else if (dictionary is null)
             {
                 unsafe
                 {
@@ -509,6 +568,15 @@ public static partial class TiSpeechNative
     /// synthesis data return <see cref="TiStatus.NotImplemented"/>.
     /// </summary>
     public static TiSynthesisResult Synthesize(TiLanguage language, string phonemes, TiVoiceOptions? options = null)
+        => Synthesize(language, phonemes, options, TiSpeechEventMask.None);
+
+    /// <summary>
+    /// As <see cref="Synthesize(TiLanguage, string, TiVoiceOptions?)"/>, also collecting the
+    /// engine's events into <see cref="TiSynthesisResult.Events"/> when <paramref name="events"/>
+    /// is not <see cref="TiSpeechEventMask.None"/>. The audio is the same either way.
+    /// </summary>
+    public static TiSynthesisResult Synthesize(TiLanguage language, string phonemes, TiVoiceOptions? options,
+        TiSpeechEventMask events)
     {
         ArgumentNullException.ThrowIfNull(phonemes);
 
@@ -528,12 +596,20 @@ public static partial class TiSpeechNative
             byte* samples = null;
             int count = 0;
             int sampleRate = 0;
+            NativeEvent* nativeEvents = null;
+            int eventCount = 0;
             int rc;
             fixed (byte* pIn = input)
             {
                 try
                 {
-                    if (options is null)
+                    if (events != TiSpeechEventMask.None)
+                    {
+                        var nativeOptions = options is null ? default : new NativeVoiceOptions(options);
+                        rc = NativeSynthesizeEvents((uint)language, pIn, options is null ? null : &nativeOptions,
+                            (uint)events & 0xF, &samples, &count, &sampleRate, &nativeEvents, &eventCount);
+                    }
+                    else if (options is null)
                         rc = NativeSynthesize((uint)language, pIn, &samples, &count, &sampleRate);
                     else
                     {
@@ -549,6 +625,11 @@ public static partial class TiSpeechNative
             }
 
             var status = (TiStatus)rc;
+            var managedEvents = new TiSpeechEvent[eventCount];
+            for (var k = 0; k < eventCount; k++)
+                managedEvents[k] = new((TiSpeechEventKind)nativeEvents[k].Code, nativeEvents[k].Value,
+                    nativeEvents[k].Sample, nativeEvents[k].TimeMs);
+            if (nativeEvents is not null) NativeFreeEvents(nativeEvents);
             if (status != TiStatus.Ok || samples is null || count <= 0)
             {
                 if (samples is not null) NativeFreeSamples(samples);
@@ -561,14 +642,22 @@ public static partial class TiSpeechNative
             {
                 var managed = new byte[count];
                 new ReadOnlySpan<byte>(samples, count).CopyTo(managed);
-                return new TiSynthesisResult(TiStatus.Ok, managed, sampleRate);
+                return new TiSynthesisResult(TiStatus.Ok, managed, sampleRate) { Events = managedEvents };
             }
             finally { NativeFreeSamples(samples); }
         }
     }
     /// <summary>Convert ordinary text and synthesize the resulting phonemes.</summary>
     public static TiSynthesisResult SynthesizeText(TiLanguage language, string text, TiVoiceOptions? options = null,
-        TiUserDictionary? dictionary = null)
+        TiUserDictionary? dictionary = null) => SynthesizeText(language, text, options, dictionary, TiSpeechEventMask.None);
+
+    /// <summary>
+    /// Convert and synthesize, collecting <paramref name="events"/>. With
+    /// <see cref="TiSpeechEventMask.Words"/> each word event's value is the word's index in
+    /// <paramref name="text"/>.
+    /// </summary>
+    public static TiSynthesisResult SynthesizeText(TiLanguage language, string text, TiVoiceOptions? options,
+        TiUserDictionary? dictionary, TiSpeechEventMask events)
     {
         if (!IsAvailable)
             return TiSynthesisResult.Failure(TiStatus.LibraryUnavailable, UnavailableReason);
@@ -576,12 +665,12 @@ public static partial class TiSpeechNative
             return TiSynthesisResult.Failure(TiStatus.NoLanguage,
                 $"Native speech is built for {DescribeLanguages(SynthesisLanguages)} only; " +
                 $"{language} phoneme previews may still be available.");
-        var phonemes = TextToPhonemes(language, text, dictionary);
+        var phonemes = TextToPhonemes(language, text, dictionary, events.HasFlag(TiSpeechEventMask.Words));
         if (!phonemes.IsSuccess)
             return TiSynthesisResult.Failure(phonemes.Status, phonemes.Message);
         if (string.IsNullOrWhiteSpace(phonemes.Phonemes))
             return TiSynthesisResult.Failure(TiStatus.BadParam, "Enter some text to speak.");
-        return Synthesize(language, phonemes.Phonemes, options);
+        return Synthesize(language, phonemes.Phonemes, options, events);
     }
 
 }

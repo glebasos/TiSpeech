@@ -117,16 +117,62 @@ public sealed record TiPhonemeResult(TiStatus Status, string Phonemes, string? M
 }
 
 /// <summary>
-/// Outcome of a synthesis attempt. Today this is always
-/// <see cref="TiStatus.NotImplemented"/> from the native reconstruction, and
-/// <see cref="Samples"/> is null rather than an empty-but-plausible buffer, so
-/// a caller that ignores <see cref="Status"/> cannot mistake it for silence it
-/// may play.
+/// Outcome of a synthesis attempt. On failure <see cref="Samples"/> is null
+/// rather than an empty-but-plausible buffer, so a caller that ignores
+/// <see cref="Status"/> cannot mistake it for silence it may play.
 /// </summary>
 public sealed record TiSynthesisResult(TiStatus Status, byte[]? Samples, int SampleRate, string? Message = null)
 {
     public bool IsSuccess => Status == TiStatus.Ok && Samples is not null;
 
+    /// <summary>What the engine reported while rendering <see cref="Samples"/>, in order.</summary>
+    public IReadOnlyList<TiSpeechEvent> Events { get; init; } = [];
+
     public static TiSynthesisResult Failure(TiStatus status, string? message = null) =>
         new(status, null, 0, message ?? status.Describe());
 }
+
+/// <summary>
+/// What the original engine's renderer reports while it speaks (TIBASE32
+/// 0x1c004543..0x1c004605). The values are the window-message codes the
+/// Windows engine posts.
+/// </summary>
+public enum TiSpeechEventKind : ushort
+{
+    /// <summary>A word starts: <see cref="TiSpeechEvent.Value"/> is its index in the
+    /// spoken text (a UTF-16 index, since only Latin-1 is spoken), or the n of an
+    /// inline <c>{wordsync n}</c>.</summary>
+    Word = 0x3EB,
+    /// <summary>The first phoneme after a pause.</summary>
+    Sentence = 0x3EC,
+    /// <summary>A syllable starts.</summary>
+    Syllable = 0x3ED,
+    /// <summary>A phoneme starts: the value is its phoneme code.</summary>
+    Phoneme = 0x3EE,
+    /// <summary>An inline <c>{usync n}</c>: the value is n &amp; 0xFF.</summary>
+    UserSync = 0x3EF,
+    /// <summary>The mouth shape changed: the value is the new shape, 1 (closed:
+    /// M, B, silence) to 10 (F, V); 3/4 rounded, 5 open, 7/8 spread, 9 tongue.</summary>
+    Mouth = 0x3F0,
+}
+
+/// <summary>Which events synthesis reports. Word and user-sync events need no
+/// flag of their own beyond <see cref="Words"/>.</summary>
+[Flags]
+public enum TiSpeechEventMask : uint
+{
+    None = 0,
+    Sentence = 0x1,
+    Syllable = 0x2,
+    Phoneme = 0x4,
+    Mouth = 0x8,
+    /// <summary>Word events for converted text (SVTextToPhon's word marks). The
+    /// original couples this to <see cref="Mouth"/> through SVTTS's single flags
+    /// argument; the audio is identical either way.</summary>
+    Words = 0x100,
+}
+
+/// <summary>One engine event, positioned by the PCM sample it belongs to.</summary>
+/// <param name="Sample">Index in <see cref="TiSynthesisResult.Samples"/> where it takes effect.</param>
+/// <param name="TimeMs">The original's own timestamp: milliseconds since its sentence began.</param>
+public readonly record struct TiSpeechEvent(TiSpeechEventKind Kind, int Value, int Sample, int TimeMs);

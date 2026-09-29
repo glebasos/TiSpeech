@@ -41,6 +41,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sv_emu import Emu, HWND  # noqa: E402
+from unicorn.x86_const import UC_X86_REG_EBX, UC_X86_REG_ESP  # noqa: E402
 
 # name, C stop address (the function), emulator address just after its call
 STAGES = [
@@ -266,6 +267,145 @@ def original_narrate_rc(dlls, phon):
     return e.call(e.exp("_SVNarrate@20"), [e.h, p, HWND, 0, 0])
 
 
+# ---------------------------------------------------------------------------
+# Renderer events (0x1c004543..0x1c004605 -> FUN_1c00498f's queue).
+#
+# The original is hooked at 0x1c00498f itself, so every report is captured in
+# order, before the 50 ms timer (0x1c00f700) would post it and before the
+# 100-entry ring could overwrite it. Each is compared as (sample, time_ms,
+# code, value): time_ms is the record's own [ebx+0xfe] >> 6, the sample is
+# the PCM already handed to waveOutWrite plus what this render call
+# (0x1c00402c, its count argument) has written, count - [ebx+0x2f4].
+# ---------------------------------------------------------------------------
+
+EVENT_FLAGS = [0, 0x08, 0x0f, 0x4f]
+EVENT_PHONEMES = [
+    "{wordsync 5}" + _HELLO + " {usync 3} AE5ND {wordsync 300}GUH5DBAY.",
+    " {usync 200} /HEH5LOW. {wordsync 1} WER5LD, {wordsync 2} AH5GEYN?",
+]
+
+
+def original_events(e, phon, flags):
+    events = []
+    render = {"count": 0}
+
+    def on_render(emu):
+        render["count"] = emu.u16(emu.mu.reg_read(UC_X86_REG_ESP) + 8)
+
+    def on_event(emu):
+        esp = emu.mu.reg_read(UC_X86_REG_ESP)
+        st = emu.mu.reg_read(UC_X86_REG_EBX)
+        before = sum(len(w) for w in emu.wave)
+        events.append((before + render["count"] - emu.u16(st + 0x2f4),
+                       emu.u32(st + 0xfe) >> 6, emu.u32(esp + 4) & 0xffff,
+                       emu.u16(esp + 8), emu.u32(esp + 0xa)))
+
+    e.hook_at(0x1c00402c, on_render)
+    e.hook_at(0x1c00498f, on_event)
+    pcm = e.narrate(phon, flags=flags)
+    return events, pcm
+
+
+class PublicEvents:
+    """libtispeech's tispeech_text_to_phonemes_flags + tispeech_synthesize_events."""
+    class Event(ctypes.Structure):
+        _fields_ = [("sample", ctypes.c_int32), ("time_ms", ctypes.c_int32),
+                    ("code", ctypes.c_uint16), ("value", ctypes.c_uint16)]
+
+    def __init__(self, path, language):
+        self.lib = ctypes.CDLL(os.path.abspath(path))
+        self.language = language
+        self.lib.tispeech_text_to_phonemes_flags.argtypes = [
+            ctypes.c_uint32, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.c_char_p, ctypes.c_int32]
+        self.lib.tispeech_synthesize_events.argtypes = [
+            ctypes.c_uint32, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_int32)]
+        self.lib.tispeech_free_samples.argtypes = [ctypes.c_void_p]
+        self.lib.tispeech_free_events.argtypes = [ctypes.c_void_p]
+
+    def text(self, text):
+        out = ctypes.create_string_buffer(1 << 16)
+        rc = self.lib.tispeech_text_to_phonemes_flags(self.language, text.encode("utf-8"), None,
+                                                      8, out, len(out))
+        return rc, out.value
+
+    def synthesize(self, phon, flags):
+        pcm, n, rate = ctypes.c_void_p(), ctypes.c_int32(), ctypes.c_int32()
+        evp, nev = ctypes.c_void_p(), ctypes.c_int32()
+        rc = self.lib.tispeech_synthesize_events(self.language, phon, None, flags,
+                                                 ctypes.byref(pcm), ctypes.byref(n),
+                                                 ctypes.byref(rate), ctypes.byref(evp),
+                                                 ctypes.byref(nev))
+        try:
+            samples = ctypes.string_at(pcm, n.value) if pcm.value else b""
+            arr = ctypes.cast(evp, ctypes.POINTER(self.Event)) if evp.value else None
+            events = [(arr[k].sample, arr[k].time_ms, arr[k].code, arr[k].value)
+                      for k in range(nev.value)]
+        finally:
+            self.lib.tispeech_free_samples(pcm)
+            self.lib.tispeech_free_events(evp)
+        return rc, events, samples
+
+
+def check_events(new_emu, recon, texts, phonemes, verbose=False, public=None):
+    """Every text through the original's SVTextToPhon with word marks (flag
+    8, which is what puts @w markers -- and so 0x3eb reports -- into the
+    phonemes), plus raw phoneme strings with {wordsync}/{usync}, narrated
+    under each EVENT_FLAGS value. Returns (cases, failures)."""
+    cases = failures = seen = 0
+    codes = {}
+    inputs = []
+    for text in texts:
+        e = new_emu()
+        rc, phon = e.text_to_phon(text.encode("latin-1"), flags=8, cap=1 << 16)
+        if rc:
+            raise RuntimeError("SVTextToPhon -> %#x" % rc)
+        inputs.append(phon)
+        if public:
+            cases += 1
+            prc, pphon = public.text(text)
+            if (prc, pphon) != (0, phon):
+                failures += 1
+                print("FAIL public word marks %r: rc=%#x\n  original %r\n  native   %r"
+                      % (text, prc, phon, pphon))
+    inputs += [p.encode("latin-1") for p in phonemes]
+    for phon in inputs:
+        for flags in EVENT_FLAGS:
+            cases += 1
+            orig, pcm = original_events(new_emu(), phon, flags)
+            bad = [ev for ev in orig if ev[3] != ev[4]]
+            mine, mine_pcm = recon.events(phon, flags)
+            want = [ev[:4] for ev in orig]
+            # The public API takes only the four enable bits, not 0x40.
+            if public and not (flags & ~0xf) and not bad and mine == want and mine_pcm == pcm:
+                prc, mine, mine_pcm = public.synthesize(phon, flags)
+                if prc:
+                    mine = "rc=%#x" % prc
+            if bad or mine != want or mine_pcm != pcm:
+                failures += 1
+                first = next((k for k, (x, y) in enumerate(zip(want, mine)) if x != y),
+                             min(len(want), len(mine)))
+                print("FAIL events flags=%#x %r: %d original vs %d native, first difference at "
+                      "#%d: %r vs %r%s%s" % (
+                          flags, phon[:60], len(want), len(mine), first,
+                          want[first] if first < len(want) else None,
+                          mine[first] if first < len(mine) else None,
+                          "" if mine_pcm == pcm else ", PCM differs",
+                          ", dword value != word value" if bad else ""))
+                continue
+            seen += len(want)
+            for ev in want:
+                codes[ev[2]] = codes.get(ev[2], 0) + 1
+            if verbose:
+                print("ok events flags=%#x %r: %d events" % (flags, phon[:50], len(want)))
+    print("events: %d reports compared, by code %s" % (
+        seen, ", ".join("%#x:%d" % kv for kv in sorted(codes.items()))))
+    return cases, failures
+
+
 class Recon:
     def __init__(self, path):
         self.lib = ctypes.CDLL(path)
@@ -283,6 +423,21 @@ class Recon:
         self.lib.oracle_pcm.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int]
         self.lib.oracle_set_speaking_mode.restype = ctypes.c_int
         self.lib.oracle_set_speaking_mode.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+
+    def events(self, phon, flags):
+        e = self.lib.oracle_new(0)
+        fn = self.lib.oracle_events
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_void_p,
+                       ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+        out = (ctypes.c_int32 * (4 * 20000))()
+        pcm = (ctypes.c_uint8 * (8 << 20))()
+        n_pcm = ctypes.c_int()
+        n = fn(e, phon, flags, out, 20000, pcm, 8 << 20, ctypes.byref(n_pcm))
+        if n < 0:
+            return n, None
+        return ([tuple(out[4 * k:4 * k + 4]) for k in range(min(n, 20000))],
+                bytes(pcm[:n_pcm.value]))
 
     def pcm(self, phon):
         e = self.lib.oracle_new(0)
@@ -713,8 +868,25 @@ def main():
     ap.add_argument("--no-default-commands", action="store_true",
                     help="skip the built-in inline-command phoneme cases (DEFAULT_INLINE_PHONEMES "
                          "/ DEFAULT_BAD_INLINE_PHONEMES) when --phoneme/--bad-phoneme are also unset")
+    ap.add_argument("--events", action="store_true",
+                    help="compare the renderer's event reports instead (word marks, "
+                         "{wordsync}/{usync}, mouth shapes) for the texts and EVENT_PHONEMES")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
+
+    if a.events:
+        texts = (a.text or DEFAULT_TEXTS) + word_texts(a.words, a.seed)
+
+        def new_emu():
+            e = Emu(a.dlls)
+            e.open()
+            return e
+        public = PublicEvents(a.frontend_library, 1) if a.frontend_library else None
+        cases, failures = check_events(new_emu, Recon(a.library), texts, EVENT_PHONEMES,
+                                       a.verbose, public)
+        print("%s: %d/%d event cases match" % ("PASS" if not failures else "FAIL",
+                                              cases - failures, cases))
+        return 1 if failures else 0
 
     if a.user_dict_library:
         failures = run_userdict_check(a.dlls, a.user_dict_library, a.verbose)

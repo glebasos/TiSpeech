@@ -254,10 +254,9 @@ asserts that fault actually happens rather than skipping the case. The six
 coefficient tables are one contiguous blob, so an over-range formant row reads
 into the next table exactly as the original does.
 
-**Not covered.** The event-reporting block `0x1c004543..0x1c004605` is not
-reconstructed, so the whole differential runs with events suppressed;
-`sv_frame_apply()` refuses without `SV_FRAME_FLAG_NO_EVENTS` rather than
-dropping events silently. Nothing is known about `FUN_1c00498f`. Frame fields
+The event-reporting block `0x1c004543..0x1c004605` and `FUN_1c00498f` were
+reconstructed later; see "Renderer events". This differential still runs
+with events suppressed; `verify_narrate.py --events` covers them. Frame fields
 `+0x05`, `+0x0c`, `+0x15`, `+0x16`, `+0x1e`, `+0x1f` are never read by the
 renderer and may matter to the unreconstructed generator or to the smoothing
 passes at `0x1c00be40`, `0x1c00cd40`, `0x1c00de60`. The differential covers
@@ -536,10 +535,8 @@ Findings from this reconstruction:
 
 The inline `{...}` command parser (`FUN_1c005180` and its helpers) is
 reconstructed in `src/narrate.c`; `verify_spanish.py --voices` drives it with
-every `{voice ...}` personality. **Not covered:** the event-reporting block of
-the renderer is still skipped. It does not touch audio, and OpenTalkIt uses
-only start, completion and error notifications. Spanish: see "Spanish
-synthesis" below.
+every `{voice ...}` personality. The renderer's events: see "Renderer events".
+Spanish: see "Spanish synthesis" below.
 
 ### English text front end — integrated (2026-09-28)
 
@@ -814,6 +811,75 @@ of `0.00`, so SVTTS never says `13:10`. The port does the same. The verifier
 now replays SVTTS's chunk loop over the ORIGINAL SVTextToPhon and narrates
 what it yields when that differs from a single call.
 
+## Renderer events — DONE, VERIFIED (2026-09-29)
+
+What Talk It! uses for word highlighting and its animated mouth. The
+renderer's frame loader (`0x1c004543..0x1c004605`, between the interpolation
+scale and the `elapsed` update) tests six things and reports each hit through
+`FUN_1c00498f`, which pushes a 32-byte record onto a 100-entry ring in the
+handle (`[handle+0xa4]`, pending flags at `+0xc84`): the handle, `elapsed >>
+6` (ms since the sentence began), the code, the value, `handle+0xc8` and
+`state+8`. A 50 ms `timeSetEvent` timer (`0x1c00f700`) posts each record
+once `timeGetTime()` passes the sentence start plus its time:
+`PostMessage(hwnd, msg, code, &record)`.
+
+| Code | Gate (`state+0x4e`) | Frame test | Value |
+|---|---|---|---|
+| `0x3f0` mouth | bit 8 | `+0x1a` changed (`+0x312` holds the last) | new mouth shape |
+| `0x3ee` phoneme | bit 4 | `+0x17 & 1`: a phoneme's first frame | `+0x0b`, the phoneme code |
+| `0x3ed` syllable | bit 2 | `+0x17 & 4`: record flag `0x80` (group_words) | stale CX |
+| `0x3ec` sentence | bit 1 | `+0x17 & 2`: record flag `0x100` (after a pause) | stale CX |
+| `0x3ef` usync | — | `+0x17 & 8`: `{usync n}` | `+0x1b` |
+| `0x3eb` word | — | `+0x17 & 0x20`: `{wordsync n}` or `@w` | `+0x1c` |
+
+Findings:
+
+- **`+0x1a` is a mouth shape, not a glottal source.** It is byte `+0x17` of
+  the phoneme definition, and its values group by articulation: M, B and
+  silence 1; W, UW, OW 3–4; AA 5; IY, EY 7–8; D, N, L, TH, DH 9; F, V 10.
+  `src/langgen.c`'s comment said "glottal source" and is corrected.
+- **Word highlighting is SVTextToPhon's flag 8.** It writes `@w<offset>`
+  before every word (the offset into the caller's text), the phoneme parser
+  turns each into a `0x334` command, and the generator puts the offset into
+  the word's first frame. The original's audio is identical with and without
+  the marks (45 texts, both languages).
+- **Stale values.** Each report pushes CX, and only the mouth, phoneme, usync
+  and word tests load it, so `0x3ed` and `0x3ec` carry whatever the previous
+  test left: the phoneme code, the mouth shape (loaded before its compare, so
+  even when unchanged), or the 0 from `xor ecx,ecx`. Reproduced.
+- **The enable bits come only from the caller.** The command parser accepts
+  `mouths`, `sentsync`, `syllsync`, `phonsync` and `allsyncs`, in the same
+  order as the bits, but nothing reads the stored values. SVTTS passes one
+  flags word to both SVTextToPhon and SVNarrate, so an application asking
+  for mouth events (8) also got word marks.
+
+The port reports through a callback instead of the ring (`sv_frame_state.
+on_event`, `sv_engine.on_event`) and adds the exact PCM sample each event
+belongs to: at a frame load the renderer has written `count - samples_left`
+samples of the current buffer. The ring's overwrite of unposted records and
+the timer's 50 ms granularity are real-time behaviour, deliberately not
+reproduced.
+
+`verify_narrate.py --events` hooks the original at `0x1c00498f` itself and
+compares every call (sample, time, code, value) for dictionary texts
+converted with word marks and phoneme strings with `{wordsync}`/`{usync}`,
+under SVNarrate flags 0, 8, 0xf and 0x4f, then the PCM; with
+`--frontend-library` it repeats that through the public ABI.
+`verify_spanish.py --events` does the same for TISPAN32:
+
+```
+$ python tools/verify_narrate.py ... --events --words 10 --frontend-library build/libtispeech.dylib
+PASS: 83/83 event cases match
+$ python tools/verify_spanish.py ... --public-library build/libtispeech.dylib --events --numbers 10 --random 10
+PASS: Spanish 229/229 event cases match
+```
+
+Public ABI: `tispeech_text_to_phonemes_flags(..., TISPEECH_TEXT_WORD_MARKS,
+...)` and `tispeech_synthesize_events()`. Managed: `TiSpeechEventMask`,
+`TiSynthesisResult.Events`, and `NativeTiSpeechBackend` as an
+`ITiSpeechEventSource` that raises `SpeechEvent` against a playback clock
+(words and mouth shapes by default).
+
 ## Open questions
 
 1. ~~**Differential verification.**~~ **SETTLED.** `tools/verify_ruleset.py`
@@ -877,7 +943,7 @@ The `TIBASE32` public API beyond its declared surface.
 | text → phonemes | English (`src/textphon_eng.c`) and Spanish (`src/textphon_span.c`) front ends complete: normalisation, user and exception dictionaries, numbers, letter-to-sound, stress, spell mode |
 | phonemes → parameter frames | **reconstructed and verified sample-exact end to end** (`src/narrate.c`, `src/duration_eng.c`, `src/duration_span.c`, `src/langgen.c`), English and Spanish |
 | parameter frames → PCM | reconstructed and verified bit-exact (`src/frames.c`, `src/dsp.c`) |
-| PCM → audio device | managed side: `SystemPcmPlayer` via `NativeTiSpeechBackend` (the original's waveOut layer is not reconstructed) |
+| PCM → audio device | managed side: `SystemPcmPlayer` via `NativeTiSpeechBackend`, events on a playback clock (the original's waveOut layer and posting timer are not reconstructed) |
 
 `tispeech_synthesize()` in `src/capi.c` now works: a SoftVoice phoneme string
 in, the original's exact 8-bit 11025 Hz PCM stream out, and

@@ -60,8 +60,9 @@ typedef struct {
     uint8_t frication_freq;
     /* +0x0a frame length divisor; see sv_frame_length(). 0x1c00450c */
     uint8_t duration;
-    /* +0x0b marker byte. Reported with event 0x3ee (0x1c004580); values 1 and
-     * 2 stop the utterance when seen two frames back (0x1c0044de). */
+    /* +0x0b marker byte: the phoneme code. Reported with event 0x3ee
+     * (0x1c004580); values 1 and 2 stop the utterance when seen two frames
+     * back (0x1c0044de). */
     uint8_t marker;
     uint8_t unread_0c;
     /* +0x0d,+0x0e glottal waveform selectors, indexing the pointer table at
@@ -82,11 +83,19 @@ typedef struct {
     uint8_t bandwidth_frication;
     uint8_t unread_15;
     uint8_t unread_16;
-    /* +0x17 event bits, gated by sv_frame_state.flags. 0x1c00457a.. */
+    /* +0x17 event bits, gated by sv_frame_state.flags. 0x1c00457a..
+     * The generator sets 0x01 on a phoneme's first frame, 0x04 there when
+     * the record starts a syllable (record flag 0x80, group_words) and 0x02
+     * when it follows a pause (record flag 0x100, mark_after_pause); 0x08 for
+     * {usync}, 0x20 for {wordsync} or an @w marker, 0x10 when nasal (which
+     * reports nothing). */
     uint8_t events;
     /* +0x18 fundamental; phase_step = pitch << 9. 0x1c004676 */
     uint16_t pitch;
-    /* +0x1a phoneme id, reported with event 0x3f0. 0x1c00454e */
+    /* +0x1a mouth shape, byte +0x17 of the phoneme definition: 1 closed
+     * (M, B, silence), 3/4 rounded (W, UW, OW), 5 open (AA), 7/8 spread (IY,
+     * EY), 9 tongue (D, N, L, TH), 10 lip-teeth (F, V). Reported with event
+     * 0x3f0 when it changes. 0x1c00454e */
     uint8_t phoneme_id;
     /* +0x1b event 0x3ef parameter. 0x1c0045d9 */
     uint8_t event_param;
@@ -187,7 +196,16 @@ typedef struct {
 /* the frame stage owns. Original offsets are given for each.                 */
 /* ------------------------------------------------------------------------ */
 
-typedef struct {
+struct sv_frame_state;
+
+/* Receives what the event block (0x1c004543..0x1c004605) passes to
+ * FUN_1c00498f: an event code and its 16-bit value. `state` is the renderer
+ * state as it stands at that moment -- `elapsed` not yet advanced past the
+ * frame, `samples_left` still owing the frame's first sample. */
+typedef void (*sv_frame_event_fn)(void *ctx, const struct sv_frame_state *state,
+                                  uint16_t code, uint16_t value);
+
+typedef struct sv_frame_state {
     sv_dsp_state dsp;
 
     /* Filter slots the reset zeroes but nothing ever reads: original offsets
@@ -247,20 +265,41 @@ typedef struct {
     uint16_t frame_left;   /* 0x30c, samples still owed by this frame */
     uint16_t restart;      /* 0x30e, non-zero asks for the full reset */
     uint16_t scratch_310;  /* 0x310, set to 0x65 by 0x1c00d396 */
-    uint8_t last_phoneme;  /* 0x312, last id reported with event 0x3f0 */
+    uint8_t last_phoneme;  /* 0x312, last mouth shape reported, event 0x3f0 */
     uint16_t speaking;     /* 0x314, cleared when the frame stream ends */
+
+    /* Not in the original's block: where FUN_1c00498f's reports go instead of
+     * its 100-entry queue. NULL discards them (the block still runs and still
+     * updates last_phoneme). */
+    sv_frame_event_fn on_event;
+    void *event_ctx;
 } sv_frame_state;
 
 /* Bit 6 of `flags`: with it set the original skips 0x1c004543..0x1c004605
- * entirely, which is the whole event-reporting block. That block is NOT
- * reconstructed, so sv_frame_apply() requires the bit and returns
- * SV_FRAMES_E_EVENTS without it rather than silently dropping events. */
+ * entirely, which is the whole event-reporting block. Bits 0..3 enable the
+ * optional reports; 0x3eb and 0x3ef need no enable bit. */
 #define SV_FRAME_FLAG_NO_EVENTS 0x40u
+/* The enable bits' order matches the command parser's sentsync, syllsync,
+ * phonsync and mouths keywords, which are parsed but never applied; only the
+ * caller's flags (SVNarrate's, or SVTTS's, which also go to SVTextToPhon)
+ * set them. */
+#define SV_FRAME_FLAG_SENTENCE  0x01u  /* 0x3ec: frame event bit 0x02 */
+#define SV_FRAME_FLAG_SYLLABLE  0x02u  /* 0x3ed: frame event bit 0x04 */
+#define SV_FRAME_FLAG_PHONEME   0x04u  /* 0x3ee: frame event bit 0x01 */
+#define SV_FRAME_FLAG_MOUTH     0x08u  /* 0x3f0 on every mouth-shape change */
+
+/* Event codes, the wParam the original posts (0x1c00f76f). */
+#define SV_EVENT_WORD     0x3ebu  /* {wordsync n} or an @w marker: value n */
+#define SV_EVENT_SENTENCE 0x3ecu  /* first phoneme after a pause; stale value */
+#define SV_EVENT_SYLLABLE 0x3edu  /* syllable start; stale value */
+#define SV_EVENT_PHONEME  0x3eeu  /* phoneme start; value: its code (+0x0b) */
+#define SV_EVENT_USYNC    0x3efu  /* {usync n}: value n & 0xff */
+#define SV_EVENT_MOUTH    0x3f0u  /* value: the new mouth shape */
 
 enum {
     SV_FRAMES_END = 0,       /* the frame stream terminated */
     SV_FRAMES_OK = 1,
-    SV_FRAMES_E_EVENTS = -1, /* flags lacks SV_FRAME_FLAG_NO_EVENTS */
+    SV_FRAMES_E_EVENTS = -1, /* no longer returned; kept for the ABI */
     SV_FRAMES_E_LENGTH = -2, /* a duration the original would #DE on */
     SV_FRAMES_E_RANGE = -3,  /* a table index past the end of the extract */
     SV_FRAMES_E_COUNT = -4   /* a zero sample count, which the original wraps */

@@ -111,7 +111,9 @@ void sv_narrate_begin(sv_engine *e, const char *text, uint32_t flags)
     e->pause_short = 0x60;
     e->pause_long = 0x8c;
     e->pause_comma = 0xc8;
-    e->st_312 = 0xff;
+    e->st_312 = 0xff;           /* 0x1c00e0d7: the renderer's last mouth shape */
+    e->render.last_phoneme = 0xff;
+    e->pcm_samples = 0;
     e->records = NULL;
 }
 
@@ -2033,27 +2035,46 @@ static int expression(sv_engine *e)
     return rc == SV_EXPR_OK ? SV_NAR_OK : SV_NAR_E_NOTIMPL;
 }
 
+/* FUN_1c00498f's record, minus what only the Win32 delivery needs (the
+ * handle, its user data, state+8). At a frame load the renderer has written
+ * exactly `count - samples_left` samples of the current buffer, and the
+ * frame's first sample is the next one. */
+static void render_event(void *ctx, const sv_frame_state *s, uint16_t code, uint16_t value)
+{
+    sv_engine *e = ctx;
+    sv_narrate_event ev;
+    ev.sample = e->pcm_samples + (uint32_t)(e->render_count - s->samples_left);
+    ev.time_ms = s->elapsed >> 6; /* 0x1c0049da */
+    ev.code = code;
+    ev.value = value;
+    e->on_event(e->event_ctx, &ev);
+}
+
 int sv_narrate_render(sv_engine *e, void (*emit)(void *ctx, const uint8_t *pcm, size_t n),
                       void *ctx)
 {
     static uint8_t buf[0x2000];
     sv_frame_state *s = &e->render;
-    /* Event reporting (0x1c004543..0x1c004605) is not reconstructed and
-     * does not touch the audio path; the renderer is run with it off. */
-    s->flags = e->flags | SV_FRAME_FLAG_NO_EVENTS;
+    s->flags = e->flags;
     s->sample_rate = e->sample_rate;
     s->scratch_310 = e->st_310;
     s->restart = e->restart;
     s->speaking = e->speaking;
+    s->on_event = e->on_event ? render_event : NULL;
+    s->event_ctx = e;
+    e->render_count = 0x2000;
     int rc = sv_frame_render(s, e->frame_tables, e->frames, buf, 0x2000);
     if (rc < 0)
         return rc;
     emit(ctx, buf, 0x2000);
+    e->pcm_samples += 0x2000;
     while (s->speaking) {
+        e->render_count = 0x1000;
         rc = sv_frame_render(s, e->frame_tables, e->frames, buf, 0x1000);
         if (rc < 0)
             return rc;
         emit(ctx, buf, 0x1000);
+        e->pcm_samples += 0x1000;
     }
     e->restart = s->restart;
     e->speaking = s->speaking;

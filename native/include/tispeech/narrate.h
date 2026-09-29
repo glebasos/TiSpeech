@@ -148,6 +148,18 @@ typedef struct sv_nar_tables {
     const char *cmd_onoff[2];     /* 0x1c012908: off, on                    */
 } sv_nar_tables;
 
+/* One report of the renderer's event block (0x1c004543..0x1c004605). The
+ * original queues {code, value, time_ms} for a 50 ms timer (0x1c00f700) that
+ * posts each once timeGetTime() passes the sentence's start plus time_ms;
+ * here the renderer hands it straight to the caller, with the exact sample
+ * the frame begins at. */
+typedef struct sv_narrate_event {
+    uint32_t sample;   /* offset in the PCM stream since sv_narrate_begin (ours) */
+    uint32_t time_ms;  /* elapsed >> 6: ms since this sentence began, as queued */
+    uint16_t code;     /* SV_EVENT_* (frames.h) */
+    uint16_t value;
+} sv_narrate_event;
+
 /* ------------------------------------------------------------------------ */
 /* The engine state, handle+0x13a in the original.                           */
 /* ------------------------------------------------------------------------ */
@@ -250,6 +262,13 @@ typedef struct sv_engine {
     uint16_t speaking;            /* +0x314 */
     uint16_t st_2b8;              /* +0x2b8 */
     uint16_t st_2f2;              /* +0x2f2 */
+
+    /* Ours: where rendered events go (NULL discards them), and the PCM
+     * position sv_narrate_render has reached, for sv_narrate_event.sample. */
+    void (*on_event)(void *ctx, const sv_narrate_event *event);
+    void *event_ctx;
+    uint32_t pcm_samples;
+    uint16_t render_count;
 } sv_engine;
 
 /* ------------------------------------------------------------------------ */
@@ -334,8 +353,11 @@ int sv_narrate_sentence(sv_engine *e, uint32_t stop_after);
 /* Render the current sentence as the original's waveOut loop does: 0x2000
  * samples when the sentence starts, then 0x1000 per completed buffer while
  * the renderer reports speech (0x1c00f5af), the last buffer padded with
- * silence. `emit` receives each buffer. Returns 0 or a negative
- * SV_FRAMES_E_* code. */
+ * silence. `emit` receives each buffer; e->on_event, if set, each event the
+ * renderer reports, before the buffer holding its sample is emitted. Which
+ * events run is e->flags: bit 0x40 none, bits 1/2/4/8 the optional ones
+ * (frames.h SV_FRAME_FLAG_*), from the `flags` given to sv_narrate_begin.
+ * Returns 0 or a negative SV_FRAMES_E_* code. */
 int sv_narrate_render(sv_engine *e, void (*emit)(void *ctx, const uint8_t *pcm, size_t n),
                       void *ctx);
 

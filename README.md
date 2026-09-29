@@ -15,7 +15,9 @@ With `TIBASE32.DLL` and `TIENG32.DLL` supplied at build time,
 `TiSpeechNative.Synthesize` returns original-voice 8-bit mono PCM at 11025 Hz;
 adding `TISPAN32.DLL` enables Spanish (`TiSpeechNative.SynthesisLanguages`).
 The complete text-to-audio path has been compared sample for sample with the
-original engine in both languages. The `svsay -t "hello world" out.wav` native
+original engine in both languages, and so have the engine's word, syllable,
+phoneme and mouth-shape events: `NativeTiSpeechBackend` raises them as
+`SpeechEvent` while it plays (`ITiSpeechEventSource`). The `svsay -t "hello world" out.wav` native
 tool converts plain text directly to a WAV file (`-s` for Spanish). SoftVoice
 user dictionaries (`SVXF` files) are supported via `TiUserDictionary` and
 `NativeTiSpeechBackend.LoadUserDictionary`.

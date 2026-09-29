@@ -61,6 +61,80 @@ static void init_state(sv_frame_state *s)
 
 /* ---------------------------------------------------------------------- */
 
+struct seen { uint16_t code[16], value[16]; uint32_t ms[16]; int n; };
+
+static void record(void *ctx, const sv_frame_state *s, uint16_t code, uint16_t value)
+{
+    struct seen *e = ctx;
+    if (e->n < 16) {
+        e->code[e->n] = code;
+        e->value[e->n] = value;
+        e->ms[e->n] = s->elapsed >> 6;
+        e->n++;
+    }
+}
+
+/* 0x1c004543..0x1c004605. Differentially checked end to end by
+ * verify_narrate.py --events; these pin the gating and the stale CX. */
+static void test_events(void)
+{
+    sv_frame_state s;
+    sv_frame frames[16];
+    struct seen e;
+
+    build_frames(frames, 16, 15);
+    frames[6].phoneme_id = 4;
+    frames[6].marker = 0x33;
+    frames[6].events = 0x01 | 0x02 | 0x04 | 0x08 | 0x20;
+    frames[6].event_param = 7;
+    frames[6].event_word = 0x1234;
+
+    /* Bit 6 suppresses everything. */
+    memset(&e, 0, sizeof e);
+    init_state(&s);
+    s.frame_index = 5;
+    s.on_event = record;
+    s.event_ctx = &e;
+    s.last_phoneme = 0xff;
+    CHECK(sv_frame_apply(&s, &sv_base_tables, frames) == SV_FRAMES_OK);
+    CHECK(e.n == 0);
+
+    /* Without enable bits only usync and wordsync report. */
+    init_state(&s);
+    s.flags = 0;
+    s.frame_index = 5;
+    s.on_event = record;
+    s.event_ctx = &e;
+    s.last_phoneme = 0xff;
+    CHECK(sv_frame_apply(&s, &sv_base_tables, frames) == SV_FRAMES_OK);
+    CHECK(e.n == 2);
+    CHECK(e.code[0] == SV_EVENT_USYNC && e.value[0] == 7);
+    CHECK(e.code[1] == SV_EVENT_WORD && e.value[1] == 0x1234);
+    CHECK(e.ms[0] == 0); /* reported before elapsed advances */
+
+    /* All enabled: mouth, 0x3ee with the marker, then 0x3ed and 0x3ec with
+     * the marker still in CX. The mouth shape reports only on a change. */
+    memset(&e, 0, sizeof e);
+    init_state(&s);
+    s.flags = 0x0f;
+    s.frame_index = 5;
+    s.on_event = record;
+    s.event_ctx = &e;
+    s.last_phoneme = 0xff;
+    CHECK(sv_frame_apply(&s, &sv_base_tables, frames) == SV_FRAMES_OK);
+    CHECK(e.n == 6);
+    CHECK(e.code[0] == SV_EVENT_MOUTH && e.value[0] == 4 && s.last_phoneme == 4);
+    CHECK(e.code[1] == SV_EVENT_PHONEME && e.value[1] == 0x33);
+    CHECK(e.code[2] == SV_EVENT_SYLLABLE && e.value[2] == 0x33);
+    CHECK(e.code[3] == SV_EVENT_SENTENCE && e.value[3] == 0x33);
+    s.frame_index = 5;
+    memset(&e, 0, sizeof e);
+    frames[6].events = 0x04;
+    CHECK(sv_frame_apply(&s, &sv_base_tables, frames) == SV_FRAMES_OK);
+    CHECK(e.n == 1);
+    CHECK(e.code[0] == SV_EVENT_SYLLABLE && e.value[0] == 4); /* the mouth shape */
+}
+
 static void test_frame_length(void)
 {
     /* Our own arithmetic, from 0x1c0044f8: rate * 150 / 60, then / (2 * d),
@@ -122,13 +196,6 @@ static void test_apply_refusals(void)
     sv_frame frames[16];
 
     build_frames(frames, 16, 15);
-
-    /* The event-reporting block at 0x1c004543 is not reconstructed, so a
-     * state that would reach it is refused rather than silently stripped. */
-    init_state(&s);
-    s.flags = 0;
-    s.frame_index = 5;
-    CHECK(sv_frame_apply(&s, &sv_base_tables, frames) == SV_FRAMES_E_EVENTS);
 
     /* A terminator ends the stream. */
     init_state(&s);
@@ -323,12 +390,6 @@ static void test_render(void)
     CHECK(sv_frame_render(&s, &sv_base_tables, frames, out, 0)
           == SV_FRAMES_E_COUNT);
 
-    /* Without the no-events flag the renderer refuses before writing. */
-    init_state(&s);
-    s.flags = 0;
-    CHECK(sv_frame_render(&s, &sv_base_tables, frames, out, 16)
-          == SV_FRAMES_E_EVENTS);
-
     /* A stream that terminates on the first frame the reset reaches pads the
      * whole buffer with silence and stops speaking (0x1c00496e). */
     build_frames(frames, 64, 5);
@@ -460,6 +521,7 @@ int main(void)
     test_frame_length();
     test_reset();
     test_apply_refusals();
+    test_events();
     test_amplitude_is_byte_indexed();
     test_apply_effects();
     test_render();

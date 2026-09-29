@@ -11,7 +11,7 @@ import ctypes
 import random
 
 from sv_emu import Emu
-from verify_narrate import Recon, STAGES, compare, _snapshot_and_narrate, ud_build
+from verify_narrate import Recon, STAGES, compare, _snapshot_and_narrate, ud_build, check_events, PublicEvents
 
 TEXTS = [
     'hola mundo', 'Buenos días. ¿Cómo estás?', 'El niño come una manzana.',
@@ -184,6 +184,8 @@ def main():
                     help='also this many texts of random numeric tokens')
     ap.add_argument('--voices', action='store_true',
                     help='narrate each text under every VOICES prefix')
+    ap.add_argument('--events', action='store_true',
+                    help='compare the renderer event reports instead (needs --narrate-library)')
     ap.add_argument('--text', action='append')
     ap.add_argument('-v', '--verbose', action='store_true')
     a = ap.parse_args()
@@ -195,6 +197,14 @@ def main():
     texts += [' '.join(rng.choice([random_number(rng)] * 3 + random_words(rng, 1))
                        for _ in range(rng.randint(1, 5))) + rng.choice(['.', '?', '', ','])
               for _ in range(a.numbers)]
+    if a.events:
+        public = PublicEvents(a.public_library, 2) if a.public_library else None
+        cases, failures = check_events(lambda: new_emu(a.dlls), Recon(a.narrate_library), texts,
+                                       [' {usync 9} OW5LAA, {wordsync 4} MUW5NDOH.'], a.verbose,
+                                       public)
+        print('%s: Spanish %d/%d event cases match' % ('PASS' if not failures else 'FAIL',
+                                                       cases - failures, cases))
+        return int(failures != 0)
     frontend = Frontend(a.library)
     recon = Recon(a.narrate_library) if a.narrate_library else None
     public = Public(a.public_library) if a.public_library else None

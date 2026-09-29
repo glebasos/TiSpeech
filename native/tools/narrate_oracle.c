@@ -176,3 +176,51 @@ int oracle_pcm(sv_engine *e, const char *phon, uint8_t *out, int max)
     }
     return (int)p.n;
 }
+
+/* The whole utterance with the renderer's event block enabled per `flags`
+ * (SVNarrate's own argument): events as {sample, time_ms, code, value}
+ * quadruples into `out`, PCM into `pcm`. Returns the event count (the PCM
+ * length in *pcm_len), or a negative error. */
+struct ev_sink {
+    int32_t *out;
+    int n, max;
+};
+
+static void on_event(void *ctx, const sv_narrate_event *ev)
+{
+    struct ev_sink *s = ctx;
+    if (s->n < s->max) {
+        s->out[4 * s->n + 0] = (int32_t)ev->sample;
+        s->out[4 * s->n + 1] = (int32_t)ev->time_ms;
+        s->out[4 * s->n + 2] = ev->code;
+        s->out[4 * s->n + 3] = ev->value;
+    }
+    s->n++;
+}
+
+int oracle_events(sv_engine *e, const char *phon, uint32_t flags, int32_t *out, int max,
+                  uint8_t *pcm, int pcm_max, int *pcm_len)
+{
+    struct pcm_sink p = {pcm, 0, (size_t)pcm_max};
+    struct ev_sink s = {out, 0, max};
+    oracle_begin(e, phon, flags);
+    e->on_event = on_event;
+    e->event_ctx = &s;
+    for (;;) {
+        int rc = sv_narrate_sentence(e, 0);
+        if (rc == SV_NAR_DONE)
+            break;
+        if (rc) {
+            e->on_event = NULL;
+            return -rc;
+        }
+        rc = sv_narrate_render(e, sink, &p);
+        if (rc) {
+            e->on_event = NULL;
+            return rc;
+        }
+    }
+    e->on_event = NULL;
+    *pcm_len = (int)p.n;
+    return s.n;
+}

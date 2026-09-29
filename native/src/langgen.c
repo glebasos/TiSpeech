@@ -2224,8 +2224,9 @@ int sv_lang_generate(sv_engine *e)
 #undef S118
         }
 
-        /* 0x1c205a70: glottal source for this frame, definition +0x17 (or
-         * the next entry's, in the second half of a diphthong). */
+        /* 0x1c205a70: mouth shape for this frame, definition +0x17 (or the
+         * next entry's, in the second half of a diphthong); 0 keeps the
+         * previous one. Reported by the renderer as event 0x3f0. */
         {
             const uint8_t *ph4 = e->window[4]->phonemes;
             uint8_t src;

@@ -216,8 +216,40 @@ static int32_t lang_open(uint32_t language, sv_langmod *m)
     return TISPEECH_E_NOLANGUAGE;
 }
 
+/* One SVTextToPhon call over the whole text, the buffer doubled until it
+ * fits (a partial result is -1 - offset): what an application calling
+ * SVTextToPhon itself gets, without SVTTS's chunking. */
+static int32_t text_to_phon_whole(uint32_t language, const sv_langmod *m, const char *text,
+                                  uint32_t flags, const sv_userdict_t *dict, char **out)
+{
+    size_t size = (strlen(text) + 10) * 6;
+    *out = NULL;
+    for (;;) {
+        int32_t rc;
+        char *b = calloc(size, 1);
+        if (!b)
+            return TISPEECH_E_OUTOFMEMORY;
+#ifdef TISPEECH_HAVE_FRONTEND_SPAN
+        if (language == TISPEECH_LANG_SPANISH)
+            rc = sv_text_to_phon_span_ex(m, text, b, (int32_t)size, flags, dict);
+        else
+#endif
+            rc = sv_text_to_phon_ex(m, text, b, (int32_t)size, flags, dict);
+        if (rc == 0) {
+            *out = b;
+            return TISPEECH_OK;
+        }
+        free(b);
+        if (rc > 0)
+            return rc;
+        if (size > ((size_t)1 << 24))
+            return TISPEECH_E_OUTOFMEMORY;
+        size *= 2;
+    }
+}
+
 static int32_t text_to_phonemes_frontend(uint32_t language, const char *text,
-                                         const sv_userdict_t *dict,
+                                         const sv_userdict_t *dict, uint32_t flags,
                                          char *out, int32_t size)
 {
     /* SVTextToPhon silently emits nothing above 0x202 input bytes. Expose
@@ -229,11 +261,13 @@ static int32_t text_to_phonemes_frontend(uint32_t language, const char *text,
     int32_t rc = lang_open(language, &m);
     if (rc != TISPEECH_OK)
         return rc;
+    if (flags != 0)
+        rc = text_to_phon_whole(language, &m, text, flags, dict, &phonemes);
 #ifdef TISPEECH_HAVE_FRONTEND_SPAN
-    if (language == TISPEECH_LANG_SPANISH)
+    else if (language == TISPEECH_LANG_SPANISH)
         rc = sv_tts_phonemes_span_ex(&m, text, 0, dict, &phonemes);
-    else
 #endif
+    else
         rc = sv_tts_phonemes_ex(&m, text, 0, dict, &phonemes);
     sv_langgen_detach(&m);
     if (rc == 0) {
@@ -283,6 +317,13 @@ int32_t tispeech_text_to_phonemes_ex(uint32_t language, const char *text,
                                      const tispeech_userdict *dict,
                                      char *out, int32_t out_size)
 {
+    return tispeech_text_to_phonemes_flags(language, text, dict, 0, out, out_size);
+}
+
+int32_t tispeech_text_to_phonemes_flags(uint32_t language, const char *text,
+                                        const tispeech_userdict *dict, uint32_t flags,
+                                        char *out, int32_t out_size)
+{
     const sv_ruleset_t *rules;
     char *work;
     const char *p;
@@ -302,6 +343,10 @@ int32_t tispeech_text_to_phonemes_ex(uint32_t language, const char *text,
      * matcher-only path has nowhere to consult it. */
     if (dict != NULL && !has_frontend(language))
         return TISPEECH_E_NOTIMPL;
+    if (flags & ~TISPEECH_TEXT_WORD_MARKS)
+        return TISPEECH_E_BADPARAM;
+    if (flags != 0 && !has_frontend(language))
+        return TISPEECH_E_NOTIMPL;
 
     status = normalise(text, &work, has_frontend(language));
     if (status != TISPEECH_OK)
@@ -310,7 +355,7 @@ int32_t tispeech_text_to_phonemes_ex(uint32_t language, const char *text,
 #if defined(TISPEECH_HAVE_ENG) || defined(TISPEECH_HAVE_FRONTEND_SPAN)
     if (has_frontend(language)) {
         status = text_to_phonemes_frontend(language, work, (const sv_userdict_t *)dict,
-                                           out, out_size);
+                                           flags, out, out_size);
         free(work);
         return status;
     }
@@ -402,9 +447,37 @@ static int32_t narrate_status(int rc)
 
 /* One utterance on a fresh engine: SVOpenSpeech's defaults (voice row 0,
  * the language's primary phoneme table) and SVNarrate's sentence loop. */
+struct event_buffer {
+    tispeech_event *data;
+    size_t n, cap;
+    int failed;
+};
+
+static void event_append(void *ctx, const sv_narrate_event *ev)
+{
+    struct event_buffer *b = ctx;
+    if (b->failed)
+        return;
+    if (b->n == b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 256;
+        tispeech_event *d = realloc(b->data, cap * sizeof *d);
+        if (!d) {
+            b->failed = 1;
+            return;
+        }
+        b->data = d;
+        b->cap = cap;
+    }
+    b->data[b->n].sample = (int32_t)ev->sample;
+    b->data[b->n].time_ms = (int32_t)ev->time_ms;
+    b->data[b->n].code = ev->code;
+    b->data[b->n].value = ev->value;
+    b->n++;
+}
+
 static int32_t synthesize_lang(uint32_t language, const char *phonemes,
-                               const tispeech_voice_options *options,
-                               struct pcm_buffer *out)
+                               const tispeech_voice_options *options, uint32_t event_flags,
+                               struct pcm_buffer *out, struct event_buffer *events)
 {
     sv_image bi = {sv_base_image, sv_base_image_va, sv_base_image_size};
     sv_nar_tables tables;
@@ -446,7 +519,13 @@ static int32_t synthesize_lang(uint32_t language, const char *phonemes,
         SET_VOICE(f0_perturb, 0x14); SET_VOICE(vowel_factor, 0x22);
 #undef SET_VOICE
     }
-    sv_narrate_begin(e, phonemes, 0);
+    /* SVNarrate's flags: the caller's event enable bits (0 without events,
+     * as SVTTS passes; the reports are then simply not collected). */
+    sv_narrate_begin(e, phonemes, event_flags);
+    if (events) {
+        e->on_event = event_append;
+        e->event_ctx = events;
+    }
     for (;;) {
         int rc = sv_narrate_sentence(e, 0);
         if (rc == SV_NAR_DONE)
@@ -459,7 +538,7 @@ static int32_t synthesize_lang(uint32_t language, const char *phonemes,
             status = TISPEECH_E_NOTIMPL;
             break;
         }
-        if (out->failed) {
+        if (out->failed || (events && events->failed)) {
             status = TISPEECH_E_OUTOFMEMORY;
             break;
         }
@@ -484,9 +563,10 @@ static int valid_override(int32_t value, int32_t lo, int32_t hi)
     return value == -1 || (value >= lo && value <= hi);
 }
 
-int32_t tispeech_synthesize_ex(uint32_t language, const char *phonemes,
-    const tispeech_voice_options *options, uint8_t **out_samples,
-    int32_t *out_count, int32_t *out_sample_rate)
+static int32_t synthesize_common(uint32_t language, const char *phonemes,
+    const tispeech_voice_options *options, uint32_t event_flags, uint8_t **out_samples,
+    int32_t *out_count, int32_t *out_sample_rate, tispeech_event **out_events,
+    int32_t *out_event_count)
 {
     /* Report nothing rather than an empty-but-plausible buffer on any
      * failure: a caller that ignores the status must not mistake it for
@@ -497,9 +577,15 @@ int32_t tispeech_synthesize_ex(uint32_t language, const char *phonemes,
         *out_count = 0;
     if (out_sample_rate != NULL)
         *out_sample_rate = 0;
+    if (out_events != NULL)
+        *out_events = NULL;
+    if (out_event_count != NULL)
+        *out_event_count = 0;
     if (phonemes == NULL)
         return TISPEECH_E_NULLTEXT;
     if (out_samples == NULL || out_count == NULL || out_sample_rate == NULL)
+        return TISPEECH_E_BADPARAM;
+    if ((out_events == NULL) != (out_event_count == NULL) || (event_flags & ~0xfu))
         return TISPEECH_E_BADPARAM;
     if (options && (options->personality < 0 || options->personality > 19
         || !valid_override(options->pitch, 10, 2000)
@@ -519,19 +605,54 @@ int32_t tispeech_synthesize_ex(uint32_t language, const char *phonemes,
         if ((unsigned char)*p >= 0x80)
             return TISPEECH_E_BADPARAM;
     struct pcm_buffer b = {NULL, 0, 0, 0};
-    int32_t status = synthesize_lang(language, phonemes, options, &b);
-    if (status != TISPEECH_OK || b.n > INT32_MAX) {
+    struct event_buffer ev = {NULL, 0, 0, 0};
+    int32_t status = synthesize_lang(language, phonemes, options, event_flags, &b,
+                                     out_events ? &ev : NULL);
+    if (status != TISPEECH_OK || b.n > INT32_MAX || ev.n > INT32_MAX) {
         free(b.data);
+        free(ev.data);
         return status != TISPEECH_OK ? status : TISPEECH_E_OUTOFMEMORY;
     }
     *out_samples = b.data;
     *out_count = (int32_t)b.n;
     *out_sample_rate = 11025;
+    if (out_events) {
+        *out_events = ev.data;
+        *out_event_count = (int32_t)ev.n;
+    }
     return TISPEECH_OK;
 #else
     (void)language;
+    (void)event_flags;
     return TISPEECH_E_NOTIMPL;
 #endif
+}
+
+int32_t tispeech_synthesize_ex(uint32_t language, const char *phonemes,
+    const tispeech_voice_options *options, uint8_t **out_samples,
+    int32_t *out_count, int32_t *out_sample_rate)
+{
+    return synthesize_common(language, phonemes, options, 0, out_samples, out_count,
+                             out_sample_rate, NULL, NULL);
+}
+
+int32_t tispeech_synthesize_events(uint32_t language, const char *phonemes,
+    const tispeech_voice_options *options, uint32_t events, uint8_t **out_samples,
+    int32_t *out_count, int32_t *out_sample_rate, tispeech_event **out_events,
+    int32_t *out_event_count)
+{
+    if (out_events == NULL || out_event_count == NULL) {
+        if (out_samples != NULL)
+            *out_samples = NULL;
+        return TISPEECH_E_BADPARAM;
+    }
+    return synthesize_common(language, phonemes, options, events, out_samples, out_count,
+                             out_sample_rate, out_events, out_event_count);
+}
+
+void tispeech_free_events(tispeech_event *events)
+{
+    free(events);
 }
 
 void tispeech_free_samples(uint8_t *samples)

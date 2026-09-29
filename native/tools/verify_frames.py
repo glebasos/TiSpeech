@@ -104,7 +104,8 @@ class FrameState(C.Structure):
         ("noise_index", C.c_uint32), ("noise_left", C.c_uint16),
         ("samples_left", C.c_uint16), ("frame_left", C.c_uint16),
         ("restart", C.c_uint16), ("scratch_310", C.c_uint16),
-        ("last_phoneme", C.c_uint8), ("speaking", C.c_uint16)]
+        ("last_phoneme", C.c_uint8), ("speaking", C.c_uint16),
+        ("on_event", C.c_void_p), ("event_ctx", C.c_void_p)]
 
 
 class FrameTables(C.Structure):

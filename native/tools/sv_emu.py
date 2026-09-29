@@ -191,6 +191,11 @@ class Emu:
         print("UNMAPPED access %d at %08x size %d (eip %08x)" % (access, addr, size, eip), file=sys.stderr)
         return False
 
+    def hook_at(self, addr, cb):
+        """Call cb(self) each time execution reaches `addr`; for addresses
+        outside the stage-hook range (0x1c003870..0x1c003da0)."""
+        self.mu.hook_add(UC_HOOK_CODE, lambda mu, a, size, ud: cb(self), begin=addr, end=addr)
+
     def _stage_hook(self, mu, addr, size, ud):
         cb = self.hooks.get(addr)
         if cb:
