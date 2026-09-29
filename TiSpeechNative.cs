@@ -15,11 +15,13 @@ namespace TiSpeech;
 /// HONESTY CONTRACT (mirrors capi.h): nothing here reports success it did not
 /// earn. <see cref="Capabilities"/> is what callers gate on, not the host
 /// operating system. English synthesis is available when both base and English
-/// data were supplied at build time. Unsupported paths return an error; no
+/// data are present, compiled in or read from the user's original DLLs at run
+/// time (<see cref="LoadDlls"/>, done automatically on first use from
+/// <see cref="DllSearchDirectories"/>). Unsupported paths return an error; no
 /// system voice or substitute audio is used.
 ///
-/// ABSENCE IS NORMAL. The native library is built from an original TIENG32.DLL
-/// that most contributors do not have, so "not loaded" is an expected steady
+/// ABSENCE IS NORMAL. The native library needs original SoftVoice DLLs that
+/// most contributors do not have, so "not loaded" is an expected steady
 /// state, not a crash. Every member here is safe to touch with no library
 /// present: <see cref="IsAvailable"/> goes false, <see cref="UnavailableReason"/>
 /// explains what was looked for and where, and the calls return a status
@@ -41,6 +43,12 @@ public static partial class TiSpeechNative
     /// <summary>Environment override: directory containing the library file.</summary>
     public const string LibraryDirectoryVariable = "TISPEECH_NATIVE_DIR";
 
+    /// <summary>Environment override: directory holding the original SoftVoice DLLs.</summary>
+    public const string DllDirectoryVariable = "TISPEECH_DLL_DIR";
+
+    /// <summary>The original DLLs the tables are read from.</summary>
+    private static readonly string[] SoftVoiceDlls = ["TIBASE32.DLL", "TIENG32.DLL", "TISPAN32.DLL"];
+
     // ── Native declarations ───────────────────────────────────────────────────
     // All parameters are blittable (raw pointers, marshalled by hand in the
     // wrappers below) so the generated stubs do no string/array marshalling of
@@ -50,6 +58,14 @@ public static partial class TiSpeechNative
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     [LibraryImport(LibraryName, EntryPoint ="tispeech_capabilities")]
     private static partial uint NativeCapabilities();
+
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    [LibraryImport(LibraryName, EntryPoint ="tispeech_load_dlls")]
+    private static unsafe partial int NativeLoadDlls(byte* dir);
+
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    [LibraryImport(LibraryName, EntryPoint ="tispeech_load_dll_files")]
+    private static unsafe partial int NativeLoadDllFiles(byte* tibase32, byte* tieng32, byte* tispan32);
 
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     [LibraryImport(LibraryName, EntryPoint ="tispeech_languages")]
@@ -281,8 +297,92 @@ public static partial class TiSpeechNative
         string? BuildInfo,
         string? LibraryPath);
 
-    private static readonly Lazy<ProbeResult> LazyProbe =
-        new(Probe, LazyThreadSafetyMode.ExecutionAndPublication);
+    // Not a Lazy: loading DLLs changes what the library reports, so the probe
+    // is redone after every successful load. StateLock also serialises loads,
+    // which capi.h requires.
+    private static readonly Lock StateLock = new();
+    private static ProbeResult? _probe;
+    private static string? _dllDirectory;
+    private static string? _dllLoadError;
+
+    private static ProbeResult Current
+    {
+        get
+        {
+            var probe = Volatile.Read(ref _probe);
+            if (probe is not null) return probe;
+            lock (StateLock)
+            {
+                if (_probe is null)
+                {
+                    _probe = Probe();
+                    if (_probe.Available && _probe.Languages == 0)
+                        LoadFromSearchDirectories();
+                }
+                return _probe;
+            }
+        }
+    }
+
+    /// <summary>
+    /// First use of a library with no tables compiled in: take them from the
+    /// first search directory holding any of the original DLLs. Caller holds
+    /// <see cref="StateLock"/>.
+    /// </summary>
+    private static void LoadFromSearchDirectories()
+    {
+        var errors = new List<string>();
+        foreach (var directory in DllSearchDirectories())
+        {
+            if (!ContainsSoftVoiceDll(directory)) continue;
+            var status = LoadLocked(directory);
+            if (status == TiStatus.Ok) { _dllLoadError = null; return; }
+            errors.Add($"{directory}: {status.Describe()}");
+        }
+        _dllLoadError = errors.Count > 0 ? string.Join(" ", errors) : null;
+    }
+
+    private static bool ContainsSoftVoiceDll(string directory)
+    {
+        try
+        {
+            // Case-insensitive on every OS, as tispeech_load_dlls() matches them.
+            return Directory.EnumerateFiles(directory).Any(f =>
+                SoftVoiceDlls.Contains(Path.GetFileName(f), StringComparer.OrdinalIgnoreCase));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static unsafe TiStatus LoadLocked(string directory)
+    {
+        var path = Utf8Z(directory);
+        TiStatus status;
+        try
+        {
+            fixed (byte* p = path) status = (TiStatus)NativeLoadDlls(p);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return TiStatus.NotImplemented; // a library from before the runtime loader
+        }
+        if (status == TiStatus.Ok)
+        {
+            _dllDirectory = Path.GetFullPath(directory);
+            _probe = Probe();
+        }
+        return status;
+    }
+
+    private static byte[]? Utf8Z(string? s)
+    {
+        if (s is null) return null;
+        var bytes = new byte[Encoding.UTF8.GetByteCount(s) + 1];
+        Encoding.UTF8.GetBytes(s, bytes);
+        return bytes;
+    }
 
     private static ProbeResult Probe()
     {
@@ -330,8 +430,7 @@ public static partial class TiSpeechNative
 
         return $"The TiSpeech native library ({FileNames()[0]}) was not found, so the reconstructed engine's " +
                "features are unavailable. This is expected if you have not built it: it comes from the " +
-               "tispeech_shared CMake target in TiSpeech/native, and its language data is extracted from an " +
-               $"original TIENG32.DLL you supply. Set {LibraryPathVariable} (the library file) or " +
+               $"tispeech_shared CMake target in TalkIt_OSS. Set {LibraryPathVariable} (the library file) or " +
                $"{LibraryDirectoryVariable} (its folder) to point at an existing build.";
     }
 
@@ -350,7 +449,7 @@ public static partial class TiSpeechNative
     /// nothing about what the library can <em>do</em>; ask
     /// <see cref="Capabilities"/> for that.
     /// </summary>
-    public static bool IsAvailable => LazyProbe.Value.Available;
+    public static bool IsAvailable => Current.Available;
 
     /// <summary>
     /// Why the library could not be used, or null when it loaded. Written for a
@@ -358,7 +457,7 @@ public static partial class TiSpeechNative
     /// error, and kept short enough to show in the UI. The full probe trail is
     /// in <see cref="UnavailableDetail"/>.
     /// </summary>
-    public static string? UnavailableReason => LazyProbe.Value.UnavailableReason;
+    public static string? UnavailableReason => Current.UnavailableReason;
 
     /// <summary>
     /// Every path that was tried while looking for the library, for a tooltip
@@ -366,37 +465,158 @@ public static partial class TiSpeechNative
     /// <see cref="UnavailableReason"/> because it can run to a dozen paths,
     /// which belongs in a diagnostic rather than on screen.
     /// </summary>
-    public static string? UnavailableDetail => LazyProbe.Value.UnavailableDetail;
+    public static string? UnavailableDetail => Current.UnavailableDetail;
 
     /// <summary>
     /// What this build of the native library can really do
     /// (<c>tispeech_capabilities()</c>). <see cref="TiEngineCapabilities.None"/>
     /// when the library is missing.
     /// </summary>
-    public static TiEngineCapabilities Capabilities => LazyProbe.Value.Capabilities;
+    public static TiEngineCapabilities Capabilities => Current.Capabilities;
 
     /// <summary>
-    /// Languages whose letter-to-sound rule data was compiled into this build
-    /// (<c>tispeech_languages()</c>). Zero when the library was built without an
-    /// original language DLL, which is a supported configuration: the library
+    /// Languages whose letter-to-sound rule data is present, compiled in or
+    /// loaded (<c>tispeech_languages()</c>). Zero when no original language DLL
+    /// was supplied either way, which is a supported configuration: the library
     /// still loads, it just cannot convert text.
     /// </summary>
-    public static TiLanguageFlags Languages => LazyProbe.Value.Languages;
+    public static TiLanguageFlags Languages => Current.Languages;
 
     /// <summary>
     /// Languages <see cref="Synthesize"/> accepts (<c>tispeech_synthesis_languages()</c>):
     /// English with TIBASE32 and TIENG32, Spanish with TISPAN32 as well.
     /// </summary>
-    public static TiLanguageFlags SynthesisLanguages => LazyProbe.Value.SynthesisLanguages;
+    public static TiLanguageFlags SynthesisLanguages => Current.SynthesisLanguages;
 
     /// <summary>
     /// The library's own one-line description of itself
     /// (<c>tispeech_build_info()</c>), or null when it is not loaded.
     /// </summary>
-    public static string? BuildInfo => LazyProbe.Value.BuildInfo;
+    public static string? BuildInfo => Current.BuildInfo;
 
     /// <summary>Full path the library was actually loaded from, or null.</summary>
-    public static string? LibraryPath => LazyProbe.Value.LibraryPath;
+    public static string? LibraryPath => Current.LibraryPath;
+
+    /// <summary>
+    /// Where the tables were loaded from at run time, or null when they are
+    /// compiled in or absent.
+    /// </summary>
+    public static string? DllDirectory { get { _ = Current; return Volatile.Read(ref _dllDirectory); } }
+
+    /// <summary>
+    /// Why the original DLLs found in <see cref="DllSearchDirectories"/> could
+    /// not be loaded on first use, or null.
+    /// </summary>
+    public static string? DllLoadError { get { _ = Current; return Volatile.Read(ref _dllLoadError); } }
+
+    /// <summary>
+    /// Where a library without compiled-in tables looks for TIBASE32.DLL,
+    /// TIENG32.DLL and TISPAN32.DLL on first use, in order: <see cref="DllDirectoryVariable"/>,
+    /// the app's folder and its <c>DLLs</c> and <c>x86</c> subfolders, the folder
+    /// holding a macOS <c>.app</c> bundle, and a per-user <c>TiSpeech/DLLs</c> folder.
+    /// </summary>
+    public static IEnumerable<string> DllSearchDirectories()
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        IEnumerable<string> Candidates()
+        {
+            var fromEnv = Environment.GetEnvironmentVariable(DllDirectoryVariable);
+            if (!string.IsNullOrWhiteSpace(fromEnv))
+                yield return fromEnv;
+
+            var baseDir = AppContext.BaseDirectory;
+            if (!string.IsNullOrEmpty(baseDir))
+            {
+                yield return baseDir;
+                yield return Path.Combine(baseDir, "DLLs");
+                yield return Path.Combine(baseDir, "x86"); // where the Windows app keeps them for TiSpeech.Host
+
+                // X.app/Contents/MacOS: files inside a signed bundle break its
+                // signature, so look beside the bundle instead.
+                var macOs = new DirectoryInfo(baseDir.TrimEnd(Path.DirectorySeparatorChar));
+                if (OperatingSystem.IsMacOS() && macOs.Name == "MacOS"
+                    && macOs.Parent is { Name: "Contents", Parent: { } bundle }
+                    && bundle.Name.EndsWith(".app", StringComparison.OrdinalIgnoreCase)
+                    && bundle.Parent is { } beside)
+                {
+                    yield return beside.FullName;
+                    yield return Path.Combine(beside.FullName, "DLLs");
+                }
+            }
+
+            var userData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (!string.IsNullOrEmpty(userData))
+                yield return Path.Combine(userData, "TiSpeech", "DLLs");
+        }
+
+        foreach (var directory in Candidates())
+        {
+            var normalised = directory.TrimEnd(Path.DirectorySeparatorChar);
+            if (normalised.Length > 0 && seen.Add(normalised))
+                yield return normalised;
+        }
+    }
+
+    /// <summary>
+    /// Reads the tables from the original DLLs in <paramref name="directory"/>
+    /// (<c>tispeech_load_dlls()</c>): TIBASE32.DLL for synthesis, TIENG32.DLL for
+    /// English, TISPAN32.DLL for Spanish. They are parsed, never executed, and
+    /// replace whatever tables were in use; on failure nothing changes.
+    /// <see cref="Capabilities"/> and the language properties report the result.
+    /// Must not run while another thread is converting or synthesising.
+    /// </summary>
+    public static TiStatus LoadDlls(string directory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(directory);
+        lock (StateLock)
+        {
+            if (!Current.Available) return TiStatus.LibraryUnavailable;
+            var status = LoadLocked(directory);
+            if (status == TiStatus.Ok) _dllLoadError = null;
+            return status;
+        }
+    }
+
+    /// <summary>
+    /// As <see cref="LoadDlls"/> with each DLL named separately
+    /// (<c>tispeech_load_dll_files()</c>); a null path skips that DLL.
+    /// </summary>
+    public static unsafe TiStatus LoadDllFiles(string? tibase32, string? tieng32, string? tispan32)
+    {
+        lock (StateLock)
+        {
+            if (!Current.Available) return TiStatus.LibraryUnavailable;
+            byte[]? b = Utf8Z(tibase32), e = Utf8Z(tieng32), sp = Utf8Z(tispan32);
+            TiStatus status;
+            try
+            {
+                fixed (byte* pb = b) fixed (byte* pe = e) fixed (byte* ps = sp)
+                    status = (TiStatus)NativeLoadDllFiles(pb, pe, ps);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return TiStatus.NotImplemented;
+            }
+            if (status == TiStatus.Ok)
+            {
+                _dllDirectory = Path.GetDirectoryName(Path.GetFullPath(tieng32 ?? tibase32 ?? tispan32!));
+                _dllLoadError = null;
+                _probe = Probe();
+            }
+            return status;
+        }
+    }
+
+    /// <summary>
+    /// What to tell a user whose library has no tables: where to put the
+    /// original DLLs, or why the ones found were refused.
+    /// </summary>
+    public static string DescribeMissingDlls(string needed) =>
+        DllLoadError is { } error
+            ? $"The original SoftVoice DLLs could not be loaded. {error}"
+            : $"{needed} not found. Copy them from your TalkIt installation into " +
+              $"{DllSearchDirectories().Last()} (or set {DllDirectoryVariable}).";
 
     /// <summary>True when <paramref name="language"/>'s rule data is in this build.</summary>
     public static bool SupportsLanguage(TiLanguage language) =>

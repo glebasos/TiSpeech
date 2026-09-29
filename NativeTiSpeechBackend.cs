@@ -27,7 +27,7 @@ internal sealed class NativePcmSynthesizer : INativePcmSynthesizer
     public TiLanguageFlags SynthesisLanguages => TiSpeechNative.SynthesisLanguages;
     public string? UnavailableReason => !TiSpeechNative.IsAvailable ? TiSpeechNative.UnavailableReason
         : !Capabilities.HasFlag(TiEngineCapabilities.Synthesis)
-            ? "English synthesis data is unavailable (TISPEECH_E_NOTIMPL). Rebuild with TIBASE32.DLL and TIENG32.DLL."
+            ? "English synthesis data is unavailable. " + TiSpeechNative.DescribeMissingDlls("TIBASE32.DLL and TIENG32.DLL")
             : null;
     public TiSynthesisResult Render(TiLanguage language, string text, TiVoiceOptions options, TiUserDictionary? dictionary) =>
         TiSpeechNative.SynthesizeText(language, text, options, dictionary);
@@ -96,7 +96,7 @@ public sealed class NativeTiSpeechBackend : ITiSpeechBackend, ITiPhonemeProvider
         && TiSpeechNative.Capabilities.HasFlag(TiEngineCapabilities.TextToPhonemes);
     string? ITiPhonemeProvider.UnavailableReason => !TiSpeechNative.IsAvailable
         ? TiSpeechNative.UnavailableReason : TiSpeechNative.Languages == 0
-            ? "The native library was built without language data. Rebuild with TIENG32.DLL or TISPAN32.DLL."
+            ? "No language data is loaded. " + TiSpeechNative.DescribeMissingDlls("TIENG32.DLL or TISPAN32.DLL")
             : null;
     string? ITiPhonemeProvider.UnavailableDetail => TiSpeechNative.UnavailableDetail;
     public TiPhonemeResult TextToPhonemes(TiLanguage language, string text)

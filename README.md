@@ -4,16 +4,15 @@ A .NET 10 library for the SoftVoice speech engine originally shipped with Micros
 
 ## Portable reconstruction
 
-`native/` reconstructs the English and Spanish text front ends and the full
+[TalkIt_OSS](https://github.com/glebasos/TalkIt_OSS), checked out as a sibling
+(`../TalkIt_OSS`, or set `-p:TiSpeechNativeDir`), reconstructs the English and Spanish text front ends and the full
 phoneme-to-PCM pipeline. `TiSpeechNative.TextToPhonemes` includes exception
 pronunciations, number expansion and default stress in both languages. Input is
 limited to 514 Latin-1 characters per call. Longer passages return an explicit
-error. The Spanish front end needs `TIENG32.DLL` as well as `TISPAN32.DLL` at
-build time; with `TISPAN32.DLL` alone it falls back to letter-to-sound rules.
+error. Both language datasets are included in the native repo.
 
-With `TIBASE32.DLL` and `TIENG32.DLL` supplied at build time,
-`TiSpeechNative.Synthesize` returns original-voice 8-bit mono PCM at 11025 Hz;
-adding `TISPAN32.DLL` enables Spanish (`TiSpeechNative.SynthesisLanguages`).
+`TiSpeechNative.Synthesize` returns original-voice 8-bit mono PCM at 11025 Hz
+for English and Spanish (`TiSpeechNative.SynthesisLanguages`).
 The complete text-to-audio path has been compared sample for sample with the
 original engine in both languages, and so have the engine's word, syllable,
 phoneme and mouth-shape events: `NativeTiSpeechBackend` raises them as
@@ -24,21 +23,24 @@ user dictionaries (`SVXF` files) are supported via `TiUserDictionary` and
 
 `NativeTiSpeechBackend` plays synthesized speech through the system player
 (`afplay` on macOS, `paplay`/`aplay` on Linux), so OpenTalkIt's Talk and Export
-work without the Windows host. CMake uses `TISPEECH_ENG_DLL`,
-`TISPEECH_SPAN_DLL`, and `TISPEECH_BASE_DLL`; MSBuild accepts `TiSpeechEngDll`,
-`TiSpeechSpanDll`, and `TiSpeechBaseDll` and detects copies in OpenTalkIt/DLLs.
+work without the Windows host on macOS/Linux.
 
-Language tables are extracted at build time from original DLLs you supply; no
-proprietary table data is stored in source control. The runtime neither loads
-these Windows DLLs nor uses an emulator. See [native/REVERSING.md](native/REVERSING.md)
-for reconstructed addresses, build options, and differential verification.
+The native repo compiles the extracted C sources in `TalkIt_OSS/data` directly.
+No original DLLs or Python are required for the portable engine's normal build
+or synthesis path. `dotnet build` attempts an optional CMake build and copies
+the library next to the app. Without native tooling, managed builds still work
+and the backend reports unavailable features. Use `-p:TiSpeechBuildNative=false`
+to skip the native build, or `TISPEECH_NATIVE_LIB` to select an existing library.
 
-The managed library targets plain `net10.0` and builds on macOS/Linux/Windows.
-`dotnet build` attempts an optional CMake build when the language DLLs are
-available beside OpenTalkIt, and copies the resulting library next to the app.
-Without native tooling or data, managed builds still work and the backend
-reports the unavailable features. Use `-p:TiSpeechBuildNative=false` to skip the
-native build, or `TISPEECH_NATIVE_LIB` to select an existing native library.
+The optional runtime DLL loader remains available for development and custom
+builds: `TiSpeechNative.LoadDlls(dir)` / `LoadDllFiles(...)`. A library configured
+without compiled data searches `TISPEECH_DLL_DIR`, the app's folder and its
+`DLLs`/`x86` subfolders, beside a macOS `.app`, then the per-user `TiSpeech/DLLs`
+folder. `DllDirectory` and `DllLoadError` report runtime loading. DLLs are parsed
+as files, never executed by the portable engine. See
+[TalkIt_OSS data](https://github.com/glebasos/TalkIt_OSS/tree/main/data) for
+regeneration and verification. The original Windows backend below still uses
+its DLLs and x86 host.
 
 ## Original Windows engine
 

@@ -68,6 +68,12 @@ public enum TiStatus
     BufferFull = 0xF002,
 
     /// <summary>
+    /// TISPEECH_E_BADDLL — an original DLL could not be read or is not the
+    /// build the reconstruction was made from.
+    /// </summary>
+    BadDll = 0xF003,
+
+    /// <summary>
     /// Not a native status code. Reported by the managed wrapper when the
     /// native library could not be loaded at all, so callers can tell
     /// "not built" apart from "built but cannot do this".
@@ -95,6 +101,7 @@ public static class TiStatusExtensions
         TiStatus.DictionaryFormat      => "Not a SoftVoice user dictionary (TISPEECH_E_DICTFORMAT).",
         TiStatus.NotImplemented        => "Not implemented in the native reconstruction yet (TISPEECH_E_NOTIMPL).",
         TiStatus.BufferFull            => "Output buffer too small (TISPEECH_E_BUFFERFULL).",
+        TiStatus.BadDll                => "An original SoftVoice DLL is unreadable or not the supported build (TISPEECH_E_BADDLL).",
         TiStatus.LibraryUnavailable    => "The TiSpeech native library is not loaded.",
         TiStatus.UnsupportedCharacters => "The letter-to-sound tables are 8-bit; the text contains characters outside Latin-1.",
         _                              => $"Unknown status 0x{(int)status:X4}.",

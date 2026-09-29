@@ -482,10 +482,10 @@ $RECYCLE.BIN/
 *.swp
 
 # ---------------------------------------------------------------------------
-# Ground rule 1 of native/REVERSING.md: no proprietary bytes in git.
+# Ground rule 1 of TalkIt_OSS/REVERSING.md: no proprietary bytes in git.
 #
 # The SoftVoice DLLs belong to SoftVoice, Inc. The rule tables and coefficient
-# data inside them are extracted at BUILD time, by native/tools/extract_*.py,
+# data inside them are extracted at BUILD time, by TalkIt_OSS/tools/extract_*.py,
 # from a copy the user already owns, into the CMake build tree. Neither the
 # DLLs nor anything generated from them may ever be committed. These patterns
 # are a backstop, not permission to put such a file in the source tree.
