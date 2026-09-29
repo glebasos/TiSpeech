@@ -251,10 +251,7 @@ endif()
 # synthesis"). Needs BOTH DLLs: TISPAN32 for its own real tables,
 # TIENG32 because langgen.c's ~200 module globals are addressed by ITS
 # literal virtual addresses (tools/extract_span_frontend.py's header explains
-# why one merged image serves both files). Cardinal-number formation (n2w)
-# and three-digit-group reading are NOT reconstructed (Spanish grammar, not a
-# table swap) — numeric tokens return SV_NAR_E_NOTIMPL rather than guessed
-# output. Linked into tispeech_shared below.
+# why one merged image serves both files). Linked into tispeech_shared below.
 # ---------------------------------------------------------------------------
 if(TISPEECH_ENG_DLL AND TISPEECH_SPAN_DLL)
     set(_span_img "${CMAKE_CURRENT_BINARY_DIR}/span_image.c")
@@ -448,7 +445,7 @@ if(TISPEECH_VERIFY_ORIGINAL)
             src/engine.c "${_span_img}" "${_span_desc_img}" "${_span}")
         add_dependencies(verify_frontend_span tispeech_frontend_span tispeech_span_desc)
         tispeech_oracle_test(original_frontend_span verify_spanish.py verify_frontend_span
-            --dlls "${_dll_dir}" --words 100)
+            --dlls "${_dll_dir}" --words 100 --numbers 150)
         tispeech_oracle_library(verify_narrate_span tools/narrate_oracle.c
             src/narrate.c src/duration_span.c src/langgen.c src/engine.c
             src/expression.c src/smoothing.c src/frames.c src/dsp.c
@@ -458,7 +455,7 @@ if(TISPEECH_VERIFY_ORIGINAL)
         tispeech_oracle_test(original_narrate_span verify_spanish.py verify_frontend_span
             --dlls "${_dll_dir}" --narrate-library "$<TARGET_FILE:verify_narrate_span>"
             --public-library "$<TARGET_FILE:tispeech_shared>"
-            --words 40 --random 100)
+            --words 40 --random 100 --numbers 40)
         # Every personality through {voice ...}: all four voice types, the
         # breathy source and both alternate F0 modes, past 256 frames.
         tispeech_oracle_test(original_narrate_span_voices verify_spanish.py verify_frontend_span

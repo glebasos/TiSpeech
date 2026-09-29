@@ -231,7 +231,6 @@ static int32_t text_to_phonemes_frontend(uint32_t language, const char *text,
         return rc;
 #ifdef TISPEECH_HAVE_FRONTEND_SPAN
     if (language == TISPEECH_LANG_SPANISH)
-        /* SV_NAR_E_NOTIMPL (== TISPEECH_E_NOTIMPL) for a numeric token. */
         rc = sv_tts_phonemes_span_ex(&m, text, 0, dict, &phonemes);
     else
 #endif

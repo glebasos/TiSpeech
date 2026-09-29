@@ -2,7 +2,9 @@
 """Compare the Spanish front end and optional full PCM pipeline with TISPAN32.
 The original runs under Unicorn only in this development tool. No dictionary
 or phoneme tables are embedded here; inputs are ordinary text and synthetic
-user dictionaries. Numeric tokens remain explicitly unsupported by the port.
+user dictionaries. --numbers adds random numeric tokens of every shape the
+normaliser dispatches on (cardinals, currency, percent, decimals, years, times,
+durations, dates, phone numbers) plus malformed ones that fall back to spelling.
 """
 import argparse
 import ctypes
@@ -21,6 +23,9 @@ TEXTS = [
     'CASA casa Casa', 'uno dos tres cuatro cinco seis siete ocho nueve diez',
     'El sol brilla. La luna sale.', 'instrucción transporte psicología atleta',
     'héroe país poeta suave viaje ruido', 'muy bien, muchas gracias',
+    'Tengo 21 años y 100 pesos.', 'Son las 12:30, el 5/4/96.', 'Cuesta $1.01 o $5.20.',
+    'Llama al (555) 123-4567 o 1-800-555-1212.', 'En 1996 y 2000, 12% y 3.14.',
+    'Hay 1,234,567 personas y 2 millones de libros.', 'Duró 1:02:03.',
 ]
 WORDS = ('hola mundo casa perro gato calle ciudad campo árbol sol luna agua aire fuego '
          'tierra suave fuerte rápido lento rojo verde blanco negro pan leche café niño '
@@ -49,6 +54,76 @@ def random_words(rng, n):
                     for _ in range(rng.randint(1, 4)))
         out.append(w.capitalize() if rng.random() < 0.1 else w)
     return out
+
+
+def random_number(rng):
+    """One numeric token, in the shapes 0x1C407e20's pattern table and n2w
+    recognise, and a few they reject."""
+    d = lambda n: ''.join(rng.choice('0123456789') for _ in range(n))
+    nz = lambda: rng.choice('123456789')
+    def grouped():
+        head = nz() + d(rng.randint(0, 2))
+        return ','.join([head] + [d(3) for _ in range(rng.randint(0, 4))])
+    shape = rng.randrange(16)
+    if shape == 0:
+        return str(rng.choice([0, 1, 2, 10, 11, 15, 16, 20, 21, 29, 30, 31, 99, 100, 101,
+                               110, 115, 120, 121, 200, 201, 500, 555, 700, 777, 900, 999]))
+    if shape == 1:
+        return nz() + d(rng.randint(0, 2))
+    if shape == 2:
+        return grouped()
+    if shape == 3:
+        return '$' + rng.choice([grouped(), '1', '0', '']) + rng.choice(['', '.' + d(2), '.' + d(1), '.' + d(3)])
+    if shape == 4:
+        return rng.choice([grouped(), '0', '']) + '.' + d(rng.randint(1, 4)) + rng.choice(['', '%'])
+    if shape == 5:
+        return grouped() + '%'
+    if shape == 6:
+        return rng.choice([nz() + d(3), '0' + d(3), '1' + d(3), '2' + d(3)])
+    if shape == 7:
+        return '%d:%s' % (rng.randint(0, 13), d(2))
+    if shape == 8:
+        return '%d:%s:%s' % (rng.randint(0, 120), d(2), d(2))
+    if shape == 9:
+        return '%d/%d/%s' % (rng.randint(1, 12), rng.randint(1, 31), d(2))
+    if shape == 10:
+        return d(3) + '-' + d(4)
+    if shape == 11:
+        return '(%s) %s-%s' % (d(3), d(3), d(4))
+    if shape == 12:
+        return '%s-%s-%s-%s' % (d(1), d(3), d(3), d(4))
+    if shape == 13:
+        return rng.choice(['%s-%s-%s', '%s/%s-%s']) % (d(3), d(3), d(4))
+    if shape == 14:
+        return d(5) + rng.choice(['', '-' + d(4)])
+    # Malformed or odd: bad grouping, stray punctuation, letters, scale words.
+    return rng.choice([d(4) + ',' + d(2), '1,00', '12,34,567', '+' + d(3), d(2) + '-' + d(2),
+                       '1.2.3', '(' + d(2), d(3) + 'A', '$' + d(2) + ' MILLONES',
+                       grouped() + ' BILLONES', '$' + grouped() + ' TRILLONES',
+                       d(2) + ' QUADRILLONES)', '5 MILLON', '(3 MILLONES)'])
+
+
+def original_tts_phonemes(e, raw, flags=0):
+    """_SVTTS@32's phoneme half (TIBASE32 0x1c00fa03..0x1c00fb68), driving the
+    ORIGINAL SVTextToPhon: a (strlen + 10) * 3 buffer (* 6 when spelling);
+    a partial result -1 - ofs restarts the text at ofs in a new buffer, -1
+    (not even one word fit) retries with the multiplier grown by 2. What the
+    public ABI must reproduce when the phonemes outgrow the first buffer,
+    which number expansion easily does."""
+    mult = 6 if flags & 4 else 3
+    chunks, rc = [], 0
+    while True:
+        if rc == -1:
+            mult += 2
+        rc, phon = e.text_to_phon(raw, flags=flags, cap=(len(raw) + 10) * mult)
+        rc = ctypes.c_int32(rc).value
+        if rc == 0:
+            return b''.join(chunks + [phon])
+        if rc > 0 or mult > 64:
+            raise RuntimeError('SVTextToPhon -> %#x' % rc)
+        if rc != -1:
+            chunks.append(phon)
+            raw = raw[-(rc + 1):]
 
 
 def new_emu(dlls):
@@ -105,6 +180,8 @@ def main():
     ap.add_argument('--words', type=int, default=0)
     ap.add_argument('--random', type=int, default=0,
                     help='also this many texts of random pseudo-Spanish words')
+    ap.add_argument('--numbers', type=int, default=0,
+                    help='also this many texts of random numeric tokens')
     ap.add_argument('--voices', action='store_true',
                     help='narrate each text under every VOICES prefix')
     ap.add_argument('--text', action='append')
@@ -115,6 +192,9 @@ def main():
                                 + rng.choice(['.', '?', '!', ',']) for _ in range(a.words)]
     texts += [' '.join(random_words(rng, rng.randint(1, 10))) + rng.choice(['.', '?', '!', ','])
               for _ in range(a.random)]
+    texts += [' '.join(rng.choice([random_number(rng)] * 3 + random_words(rng, 1))
+                       for _ in range(rng.randint(1, 5))) + rng.choice(['.', '?', '', ','])
+              for _ in range(a.numbers)]
     frontend = Frontend(a.library)
     recon = Recon(a.narrate_library) if a.narrate_library else None
     public = Public(a.public_library) if a.public_library else None
@@ -159,6 +239,11 @@ def main():
                 if not bad and public and not voice:
                     total += 1
                     rc, pub_phon, pub_pcm = public.run(text)
+                    tts_phon = original_tts_phonemes(new_emu(a.dlls), raw)
+                    if tts_phon != phon:
+                        # SVTTS re-chunked: narrate what it produced instead.
+                        _, pcm = _snapshot_and_narrate(new_emu(a.dlls), tts_phon)
+                        phon = tts_phon
                     if (rc, pub_phon, pub_pcm) != (0, phon, pcm):
                         bad = 'public ABI: rc=%#x phonemes %s, PCM %s' % (
                             rc, 'match' if pub_phon == phon else 'differ',

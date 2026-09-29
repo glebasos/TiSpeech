@@ -6,8 +6,7 @@ A .NET 10 library for the SoftVoice speech engine originally shipped with Micros
 
 `native/` reconstructs the English and Spanish text front ends and the full
 phoneme-to-PCM pipeline. `TiSpeechNative.TextToPhonemes` includes exception
-pronunciations, number expansion and default stress; Spanish numbers are not
-reconstructed yet and return an explicit error (spell them out). Input is
+pronunciations, number expansion and default stress in both languages. Input is
 limited to 514 Latin-1 characters per call. Longer passages return an explicit
 error. The Spanish front end needs `TIENG32.DLL` as well as `TISPAN32.DLL` at
 build time; with `TISPAN32.DLL` alone it falls back to letter-to-sound rules.

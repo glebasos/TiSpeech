@@ -534,11 +534,12 @@ Findings from this reconstruction:
   (`0x1c204610`), which near the end of the array runs past the original's
   allocation; the port allocates slack frames that are never read.
 
-**Not covered.** The inline `{...}` command parser (`FUN_1c005180` and its
-helpers) is not reconstructed: `sv_narrate_sentence` returns
-`SV_NAR_E_NOTIMPL` on a `{`. The event-reporting block of the renderer is
-still skipped (it does not touch audio). Spanish: see "Spanish synthesis"
-below.
+The inline `{...}` command parser (`FUN_1c005180` and its helpers) is
+reconstructed in `src/narrate.c`; `verify_spanish.py --voices` drives it with
+every `{voice ...}` personality. **Not covered:** the event-reporting block of
+the renderer is still skipped. It does not touch audio, and OpenTalkIt uses
+only start, completion and error notifications. Spanish: see "Spanish
+synthesis" below.
 
 ### English text front end — integrated (2026-09-28)
 
@@ -757,6 +758,62 @@ tests had never reached, both fixed:
   stores its phoneme table back into the engine (`0x1c003eef`), so the next
   sentence's parse starts with it; the port kept it local.
 
+## Spanish numbers — DONE, VERIFIED (2026-09-29)
+
+The last piece of the Spanish front end. Aligning TISPAN32's number code
+against TIENG32's (capstone shapes, immediates normalised, `difflib` over the
+instruction lists) splits it cleanly:
+
+| TISPAN32 | TIENG32 | |
+|---|---|---|
+| `0x1C407e20` normaliser | `0x1c208150` | identical, 579 instructions |
+| `0x1C408520` `0x1C408750` `0x1C408960` `0x1C408bf0` `0x1C408cc0` `0x1C408df0` `0x1C408ec0` handlers | `0x1c208850`… | identical |
+| `0x1C409400` digit spelling | `0x1c209580` | identical |
+| `0x1C407da0` scale word | `0x1c2080d0` | same shape, `MILLON`/`BILLON`/`TRILLON`/`QUADRILLON` |
+| `0x1C4073D0` n2w | `0x1c207890` | **Spanish** |
+| `0x1C408f60` three digits | `0x1c209290` | **Spanish** |
+| `0x1C4090F0` year | `0x1c209380` | **Spanish** |
+
+For the identical ones, the Spanish literal addresses were read off the
+aligned instruction pairs, which gives an exact English→Spanish map (working
+buffers `0x1c411d80`/`0x1c4109e0`/`0x1c4109d0`, the pattern table
+`0x1C40E628` with the same seventeen patterns, every vocabulary string). The
+three Spanish functions are transcribed from TISPAN32 directly:
+
+- **n2w** keeps English's validation, currency, percent, scale and zero-group
+  cut, but reads groups the Spanish way: a lone `1` group is `UW4NOH` only
+  when no scale word follows (so `1,000` is `MIY5L`), hundreds come from a
+  nine-way jump table (`0x1c407d48`: 100 `SIYEH4N`, 500/700/900 irregular,
+  then `TOHS` or, for 1xx, `TOH`), tens have two tables (`0x1C40EBE8` alone,
+  `0x1C40EC10` with `IY` before a unit), decimals are `IY`, the digits and
+  `DEH5SIYMAAL`, and cents have no "and" and always use the bare tens form.
+- **three digits** says 100 and N00 as one word and anything else digit by
+  digit, where English always says the first digit.
+- **year** is a cardinal: `MIY5L` (the thousands digit only above 1), then
+  n2w's hundreds — with stress 4 rather than 3 on 700 and 900, a second copy
+  of the table — and tens.
+
+`tools/verify_spanish.py --numbers N` adds N texts of random numeric tokens in
+every shape the pattern table and n2w accept, plus malformed ones that fall
+back to spelling and scale words:
+
+```
+$ python tools/verify_spanish.py --dlls DIR --library build/libverify_frontend_span.dylib --numbers 400
+PASS: Spanish 12754/12754 comparisons match (flags, buffer retries, user dictionary)
+$ python tools/verify_spanish.py ... --narrate-library ... --public-library build/libtispeech.dylib --numbers 150
+PASS: Spanish 350/350 comparisons match through PCM
+```
+
+**The public ABI is compared against SVTTS, not one SVTextToPhon call.**
+Number expansion easily outgrows `_SVTTS@32`'s first buffer (`(strlen + 10) *
+3`), and SVTTS then restarts the text at the word that did not fit
+(`0x1c00fa8c`: `text -= rc + 1`). Text can be lost at that seam, in the
+original too: for `+807 9/5/07 13:10 0.00 Crédiax` at SVTTS's 120-byte
+buffer, the original SVTextToPhon stops before `13:10` but returns the offset
+of `0.00`, so SVTTS never says `13:10`. The port does the same. The verifier
+now replays SVTTS's chunk loop over the ORIGINAL SVTextToPhon and narrates
+what it yields when that differs from a single call.
+
 ## Open questions
 
 1. ~~**Differential verification.**~~ **SETTLED.** `tools/verify_ruleset.py`
@@ -769,7 +826,8 @@ tests had never reached, both fixed:
      unreachable in the original table. Confirmed by direct probe against
      `TIENG32.DLL` — original and reconstruction agree byte for byte.
    - Spanish is now also covered: 20,000 randomized strings and seven word
-     probes agree with `TISPAN32` (see above); its complete front end is not ported.
+     probes agree with `TISPAN32` (see above), and its whole front end is
+     ported (see "Spanish numbers").
 2. **`sv_language` vtable semantics.** Field kinds (code vs. data) are certain;
    what the four functions *do* is inferred from call-site context only. Left
    deliberately typed as opaque rather than guessed into a wrong signature.
@@ -804,7 +862,11 @@ tests had never reached, both fixed:
    SVTTS takes its own spell flag (`4`) from its caller, not from the handle.
    No `testb $0x10` on `+0xcc` exists in either DLL; the only candidate reader
    is `0x1c00df33`, which copies `handle+0xcc` into narrate state `+0x4e`.
-   Unresolved; the native backend still rejects non-natural modes with NOTIMPL.
+   **Settled for audio:** `verify_narrate.py`'s speaking-mode check finds the
+   original's PCM identical across every valid value, and the same holds for
+   Spanish text with numbers. `NativeTiSpeechBackend` therefore accepts every
+   mode and speaks as the original does; only what the bit was *meant* for
+   remains unknown.
 
 ## Not started
 
@@ -812,7 +874,7 @@ The `TIBASE32` public API beyond its declared surface.
 
 | Stage | Status |
 |---|---|
-| text → phonemes | English front end integrated (`src/textphon_eng.c`), including normalisation, exceptions, numbers and stress; Spanish (`src/textphon_span.c`) everything except numeric tokens, which return NOTIMPL (TISPAN32's cardinal-number grammar at `0x1C4073D0` is not ported) |
+| text → phonemes | English (`src/textphon_eng.c`) and Spanish (`src/textphon_span.c`) front ends complete: normalisation, user and exception dictionaries, numbers, letter-to-sound, stress, spell mode |
 | phonemes → parameter frames | **reconstructed and verified sample-exact end to end** (`src/narrate.c`, `src/duration_eng.c`, `src/duration_span.c`, `src/langgen.c`), English and Spanish |
 | parameter frames → PCM | reconstructed and verified bit-exact (`src/frames.c`, `src/dsp.c`) |
 | PCM → audio device | managed side: `SystemPcmPlayer` via `NativeTiSpeechBackend` (the original's waveOut layer is not reconstructed) |

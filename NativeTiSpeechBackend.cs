@@ -42,7 +42,6 @@ public sealed class NativeTiSpeechBackend : ITiSpeechBackend, ITiPhonemeProvider
     private readonly INativePcmSynthesizer _synthesizer;
     private TiVoiceOptions _voice = new();
     private TiLanguage _language = TiLanguage.English;
-    private TiSpeakingMode _speakingMode = TiSpeakingMode.Natural;
     private bool _open, _disposed, _paused;
     private CancellationTokenSource? _active;
     private string? _openError;
@@ -153,9 +152,6 @@ public sealed class NativeTiSpeechBackend : ITiSpeechBackend, ITiPhonemeProvider
             voice = _voice;
             language = _language;
             dictionary = _dictionary;
-            if (_speakingMode != TiSpeakingMode.Natural)
-                return Task.FromResult(TiSynthesisResult.Failure(TiStatus.NotImplemented,
-                    "Native speech currently supports the natural speaking mode only."));
         }
         return Task.Run(() =>
         {
@@ -257,7 +253,13 @@ public sealed class NativeTiSpeechBackend : ITiSpeechBackend, ITiPhonemeProvider
     public void SetRate(int value) { lock (_sync) _voice = _voice with { Rate = value }; }
     public void SetVoicingMode(TiVoicingMode value) { lock (_sync) _voice = _voice with { Voicing = (int)value }; }
     public void SetF0Style(TiF0Style value) { lock (_sync) _voice = _voice with { F0Style = (int)value }; }
-    public void SetSpeakingMode(TiSpeakingMode value) { lock (_sync) _speakingMode = value; }
+    /// <summary>
+    /// Accepted and ignored. SVSetSpeakingMode (TIBASE32 0x1c00ecd0) only sets or
+    /// clears one handle bit, and the original engine's audio is identical in
+    /// every mode (native/tools/verify_narrate.py's speaking-mode check), so
+    /// speech here matches what TIBASE32.DLL produces for any mode.
+    /// </summary>
+    public void SetSpeakingMode(TiSpeakingMode value) { }
     public void SetF0Range(int value) { lock (_sync) _voice = _voice with { F0Range = value }; }
     public void SetF0Perturb(int value) { lock (_sync) _voice = _voice with { F0Perturb = value }; }
     public void SetVowelFactor(int value) { lock (_sync) _voice = _voice with { VowelFactor = value }; }

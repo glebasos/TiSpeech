@@ -196,8 +196,9 @@ int main(void)
     /* The original SVTextToPhon, including default stress. */
     CHECK(tispeech_text_to_phonemes(TISPEECH_LANG_SPANISH, "hola mundo", output, sizeof(output)) == TISPEECH_OK);
     CHECK(strcmp(output, " OH5LAA MUW5NDOH") == 0);
-    /* Spanish cardinal numbers are not reconstructed. */
-    CHECK(tispeech_text_to_phonemes(TISPEECH_LANG_SPANISH, "hola 42", output, sizeof(output)) == TISPEECH_E_NOTIMPL);
+    /* Spanish number reading, TISPAN32 0x1C4073D0 (original's output). */
+    CHECK(tispeech_text_to_phonemes(TISPEECH_LANG_SPANISH, "hola 42", output, sizeof(output)) == TISPEECH_OK);
+    CHECK(strcmp(output, " OH5LAA  KWAAREH5NTAAIY DOH5S ") == 0);
 #  else
     /* Confirmed by TISPAN32!0x1c4062f0 oracle probes, not another C path. */
     CHECK(tispeech_text_to_phonemes(TISPEECH_LANG_SPANISH, "hola mundo", output, sizeof(output)) == TISPEECH_OK);

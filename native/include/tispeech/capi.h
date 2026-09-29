@@ -83,8 +83,9 @@ TISPEECH_API const char *tispeech_build_info(void);
  * expansion, letter-to-sound and default-stress stages, retaining original
  * spacing. English input is limited to 514 decoded Latin-1 bytes; longer
  * input returns TISPEECH_E_BADPARAM instead of the original's silent empty
- * output. Spanish currently covers letter-to-sound rules only. For user
- * dictionaries see tispeech_text_to_phonemes_ex(). On failure, a valid output buffer is
+ * output. Spanish is TISPAN32's front end, numbers included, when the build
+ * has TIENG32 as well as TISPAN32, and letter-to-sound rules only when it has
+ * TISPAN32 alone. For user dictionaries see tispeech_text_to_phonemes_ex(). On failure, a valid output buffer is
  * cleared; callers can grow it and retry TISPEECH_E_BUFFERFULL.
  */
 TISPEECH_API int32_t tispeech_text_to_phonemes(uint32_t language,
@@ -109,8 +110,8 @@ TISPEECH_API void tispeech_userdict_free(tispeech_userdict *dict);
 /*
  * As tispeech_text_to_phonemes(), consulting `dict` (may be NULL) before the
  * built-in exceptions, numbers and rules, exactly where the original does.
- * English only for now: a dictionary with another language returns
- * TISPEECH_E_NOTIMPL.
+ * A dictionary with a language whose full front end this build lacks (Spanish
+ * without TIENG32) returns TISPEECH_E_NOTIMPL.
  */
 TISPEECH_API int32_t tispeech_text_to_phonemes_ex(uint32_t language,
                                                   const char *text,

@@ -379,8 +379,7 @@ public static partial class TiSpeechNative
     /// Text-to-phoneme conversion on macOS, Linux and Windows. English and
     /// Spanish use the reconstructed normaliser, exception dictionary and
     /// stress rules (Spanish needs TIENG32 as well as TISPAN32 at build time,
-    /// otherwise letter-to-sound rules only; Spanish numbers are not
-    /// reconstructed). A <paramref name="dictionary"/> is consulted first, as
+    /// otherwise letter-to-sound rules only). A <paramref name="dictionary"/> is consulted first, as
     /// SVTextToPhon does. At most 514 Latin-1 characters per call.
     /// </summary>
     public static TiPhonemeResult TextToPhonemes(TiLanguage language, string text,
@@ -488,8 +487,6 @@ public static partial class TiSpeechNative
         TiStatus.NoLanguage =>
             $"No {language} letter-to-sound data in this build of the TiSpeech native library " +
             $"(it has: {DescribeLanguages(Languages)}).",
-        TiStatus.NotImplemented when language == TiLanguage.Spanish =>
-            "Spanish number reading is not reconstructed yet; spell numbers out as words.",
         _ => status.Describe(),
     };
 
