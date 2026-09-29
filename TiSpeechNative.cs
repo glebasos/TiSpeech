@@ -216,7 +216,10 @@ public static partial class TiSpeechNative
 
             // Under some hosts (shadow copy, test runners) the assembly does not
             // sit in AppContext.BaseDirectory, so try its own folder too.
+            // Location is empty in a single-file release; the check below skips it.
+#pragma warning disable IL3000
             var assemblyDir = Path.GetDirectoryName(typeof(TiSpeechNative).Assembly.Location);
+#pragma warning restore IL3000
             if (!string.IsNullOrEmpty(assemblyDir))
             {
                 yield return assemblyDir;
