@@ -62,7 +62,7 @@ add_library(tispeech_userdict STATIC src/userdict.c)
 target_include_directories(tispeech_userdict PUBLIC include)
 
 add_library(tispeech_narrate STATIC
-    src/narrate.c src/duration_eng.c src/langgen.c src/engine.c src/expression.c
+    src/narrate.c src/duration_eng.c src/duration_span.c src/langgen.c src/engine.c src/expression.c
     src/textphon_eng.c)
 target_link_libraries(tispeech_narrate PUBLIC tispeech_smoothing tispeech_frames tispeech_rules tispeech_userdict)
 
@@ -247,14 +247,14 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Spanish text front end (src/textphon_span.c) and frame-generator relocation
-# (src/langgen.c, reused unmodified — see REVERSING.md "the language modules
-# are one code base"). Needs BOTH DLLs: TISPAN32 for its own real tables,
+# (src/langgen.c, shared with English — see REVERSING.md "Spanish
+# synthesis"). Needs BOTH DLLs: TISPAN32 for its own real tables,
 # TIENG32 because langgen.c's ~200 module globals are addressed by ITS
 # literal virtual addresses (tools/extract_span_frontend.py's header explains
 # why one merged image serves both files). Cardinal-number formation (n2w)
 # and three-digit-group reading are NOT reconstructed (Spanish grammar, not a
 # table swap) — numeric tokens return SV_NAR_E_NOTIMPL rather than guessed
-# output. Not yet linked into tispeech_shared's public ABI; see REVERSING.md.
+# output. Linked into tispeech_shared below.
 # ---------------------------------------------------------------------------
 if(TISPEECH_ENG_DLL AND TISPEECH_SPAN_DLL)
     set(_span_img "${CMAKE_CURRENT_BINARY_DIR}/span_image.c")
@@ -298,13 +298,32 @@ elseif(NOT TISPEECH_SPAN_DLL)
 endif()
 
 if(TISPEECH_SPAN_DLL)
-    target_link_libraries(tispeech_shared PRIVATE tispeech_lang_span)
+    if(NOT TARGET tispeech_frontend_span)   # which links it itself
+        target_link_libraries(tispeech_shared PRIVATE tispeech_lang_span)
+    endif()
     target_compile_definitions(tispeech_shared PRIVATE TISPEECH_HAVE_SPAN=1)
+endif()
+
+# tispeech_userdict_load/free are exported whatever language data is built;
+# the front ends already bring userdict in through tispeech_narrate.
+if(NOT TISPEECH_ENG_DLL AND NOT TARGET tispeech_frontend_span)
+    target_link_libraries(tispeech_shared PRIVATE tispeech_userdict)
 endif()
 
 if(TARGET tispeech_synth_eng)
     target_link_libraries(tispeech_shared PRIVATE tispeech_synth_eng)
     target_compile_definitions(tispeech_shared PRIVATE TISPEECH_HAVE_SYNTH_ENG=1)
+endif()
+
+# The reconstructed Spanish front end replaces the matcher-only path, and
+# with TIBASE32 also gives Spanish synthesis (src/langgen.c's Spanish rules,
+# src/duration_span.c).
+if(TARGET tispeech_frontend_span)
+    target_link_libraries(tispeech_shared PRIVATE tispeech_frontend_span tispeech_span_desc)
+    target_compile_definitions(tispeech_shared PRIVATE TISPEECH_HAVE_FRONTEND_SPAN=1)
+    if(TARGET tispeech_synth_eng)
+        target_compile_definitions(tispeech_shared PRIVATE TISPEECH_HAVE_SYNTH_SPAN=1)
+    endif()
 endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_capi.c")
@@ -322,6 +341,12 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_capi.c")
     endif()
     if(TARGET tispeech_synth_eng)
         target_compile_definitions(test_capi PRIVATE TISPEECH_HAVE_SYNTH_ENG=1)
+    endif()
+    if(TARGET tispeech_frontend_span)
+        target_compile_definitions(test_capi PRIVATE TISPEECH_HAVE_FRONTEND_SPAN=1)
+        if(TARGET tispeech_synth_eng)
+            target_compile_definitions(test_capi PRIVATE TISPEECH_HAVE_SYNTH_SPAN=1)
+        endif()
     endif()
     add_test(NAME capi COMMAND test_capi)
 endif()
@@ -417,13 +442,27 @@ if(TISPEECH_VERIFY_ORIGINAL)
     # TISPAN32's own real .data image (sv_langmod_init's descriptor), so
     # gated on tispeech_frontend_span itself (TISPEECH_ENG_DLL AND
     # TISPEECH_SPAN_DLL) rather than TISPEECH_SPAN_DLL alone.
-    if(TARGET tispeech_frontend_span)
+    if(TARGET tispeech_frontend_span AND TISPEECH_BASE_DLL)
         tispeech_oracle_library(verify_frontend_span tools/textphon_span_oracle.c
             src/textphon_span.c src/userdict.c src/ruleset.c src/langgen.c
             src/engine.c "${_span_img}" "${_span_desc_img}" "${_span}")
-        add_dependencies(verify_frontend_span tispeech_lang_span)
-        tispeech_oracle_test(original_frontend_span verify_narrate.py verify_frontend_span
-            --dlls "${_dll_dir}" --library dummy --language span --frontend-only
-            --words "${TISPEECH_VERIFY_CASES}")
+        add_dependencies(verify_frontend_span tispeech_frontend_span tispeech_span_desc)
+        tispeech_oracle_test(original_frontend_span verify_spanish.py verify_frontend_span
+            --dlls "${_dll_dir}" --words 100)
+        tispeech_oracle_library(verify_narrate_span tools/narrate_oracle.c
+            src/narrate.c src/duration_span.c src/langgen.c src/engine.c
+            src/expression.c src/smoothing.c src/frames.c src/dsp.c
+            "${_base_img}" "${_span_img}" "${_span_desc_img}" "${_base}")
+        target_compile_definitions(verify_narrate_span PRIVATE TISPEECH_ORACLE_SPAN=1)
+        add_dependencies(verify_narrate_span tispeech_frontend_span tispeech_span_desc tispeech_synth_eng)
+        tispeech_oracle_test(original_narrate_span verify_spanish.py verify_frontend_span
+            --dlls "${_dll_dir}" --narrate-library "$<TARGET_FILE:verify_narrate_span>"
+            --public-library "$<TARGET_FILE:tispeech_shared>"
+            --words 40 --random 100)
+        # Every personality through {voice ...}: all four voice types, the
+        # breathy source and both alternate F0 modes, past 256 frames.
+        tispeech_oracle_test(original_narrate_span_voices verify_spanish.py verify_frontend_span
+            --dlls "${_dll_dir}" --narrate-library "$<TARGET_FILE:verify_narrate_span>"
+            --voices)
     endif()
 endif()

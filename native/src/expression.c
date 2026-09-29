@@ -256,6 +256,7 @@ int sv_expression_apply(sv_expr_state *state,
     uint16_t phase = 0;          /* [esp+0x16], zeroed at 0x1c00be4b */
     uint16_t phase_step;         /* [esp+0x12] */
     uint16_t flutter_index = 0;  /* [esp+0x14], zeroed at 0x1c00be52 */
+    size_t flutter_at = 0;       /* [esp+0x28], as an offset into the table */
     int32_t glide_target;        /* [esp+0x18] */
     int32_t glide_step;          /* [esp+0x2c] */
     size_t frame = 0;            /* edi, as an index rather than a pointer */
@@ -411,7 +412,7 @@ int sv_expression_apply(sv_expr_state *state,
             /* 5. Flutter, 0x1c00c17d. Note the PRE-rescale pitch: `ecx` still
              * holds what the frame carried on entry. */
             if (state->flutter_depth != 0) {
-                int32_t jitter = (int32_t)(int8_t)tables->flutter[flutter_index];
+                int32_t jitter = (int32_t)(int8_t)tables->flutter[flutter_at];
 
                 jitter = sv_mul32(jitter, (int32_t)state->flutter_depth);
                 jitter = sv_mul32(jitter, (int32_t)raw_pitch);
@@ -419,18 +420,22 @@ int sv_expression_apply(sv_expr_state *state,
                 f->pitch = (uint16_t)sv_wrap32((int64_t)f->pitch
                                                + (int64_t)jitter);
             }
-            /* 0x1c00c1a3 and 0x1c00c28a: the original keeps a pointer and a
-             * counter and resets both together, which one index reproduces.
-             * Neither is reset between records: the flutter runs across the
-             * whole utterance. */
+            /* 0x1c00c1a3: the counter wraps at 256 and resets the pointer
+             * with it, but the pointer's own increment is at the bottom of
+             * the frame loop (0x1c00c28a), after the reset -- so after the
+             * first wrap the pointer leads the counter by one and each lap
+             * reads the byte after the table. Neither is reset between
+             * records: the flutter runs across the whole utterance. */
             flutter_index = (uint16_t)(flutter_index + 1);
             if (flutter_index >= SV_EXPR_FLUTTER_BYTES) {
                 flutter_index = 0;
+                flutter_at = 0;
             }
 
             /* 6. The source pair. */
             sv_expr_source(state, tables, f, raw_pitch);
 
+            ++flutter_at;
             ++frame;
         }
     }

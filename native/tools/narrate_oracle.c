@@ -22,6 +22,21 @@ extern const sv_expr_tables sv_base_tables_expression;
 extern const sv_image sv_eng_image_text[];
 extern const size_t sv_eng_image_text_count;
 
+#ifdef TISPEECH_ORACLE_SPAN
+extern const uint8_t sv_span_image[];
+extern const uint32_t sv_span_image_va, sv_span_image_size;
+extern const uint32_t sv_span_desc_image_desc[10];
+extern const sv_image sv_span_image_text[];
+extern const size_t sv_span_image_text_count;
+#define sv_eng_image sv_span_image
+#define sv_eng_image_va sv_span_image_va
+#define sv_eng_image_size sv_span_image_size
+#define sv_eng_image_desc sv_span_desc_image_desc
+#define sv_eng_image_text sv_span_image_text
+#define sv_eng_image_text_count sv_span_image_text_count
+#define sv_eng_duration sv_span_duration
+#endif
+
 static sv_nar_tables base;
 static sv_langmod eng;
 static sv_engine engine;
@@ -41,7 +56,7 @@ sv_engine *oracle_new(unsigned voice_row)
     engine.base = &base;
     engine.frame_tables = &sv_base_tables;
     engine.expr_tables = &sv_base_tables_expression;
-    engine.modules[0] = &eng;
+    engine.modules[eng.id - 1] = &eng;   /* TIBASE32 0x1c012038: English 0, Spanish 1 */
     engine.lang = &eng;
     engine.lang_primary = &eng;
     engine.phonemes = eng.phonemes_a;

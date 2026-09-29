@@ -60,6 +60,11 @@ TISPEECH_API uint32_t tispeech_capabilities(void);
  * Zero when the build was configured without an original language DLL. */
 TISPEECH_API uint32_t tispeech_languages(void);
 
+/* Bitmask of TISPEECH_LANG_* that tispeech_synthesize() accepts. Zero unless
+ * TISPEECH_CAP_SYNTHESIS is set; Spanish needs TISPAN32 as well as TIBASE32
+ * and TIENG32 at build time. */
+TISPEECH_API uint32_t tispeech_synthesis_languages(void);
+
 /* Human-readable build description, for logs and the about box. Static
  * storage; the caller must not free it. */
 TISPEECH_API const char *tispeech_build_info(void);
@@ -121,13 +126,14 @@ TISPEECH_API int32_t tispeech_text_to_phonemes_ex(uint32_t language,
  * the last one padded with silence (0x80).
  *
  * Verified sample-for-sample against the original engine run under an
- * emulator (tools/verify_narrate.py). English only; the voice is SVOpenSpeech's
- * default (row 0).
+ * emulator (tools/verify_narrate.py, tools/verify_spanish.py). Languages:
+ * tispeech_synthesis_languages(); the voice is SVOpenSpeech's default (row 0).
  *
  * Returns TISPEECH_OK, TISPEECH_E_NOTIMPL when this build has no synthesis
  * data (see tispeech_capabilities()) or the string uses an inline-command
  * form not yet reconstructed ("{...}"), TISPEECH_E_NOLANGUAGE for a language
- * other than English, TISPEECH_E_BADPARAM for an unknown phoneme name, or
+ * not in tispeech_synthesis_languages(), TISPEECH_E_BADPARAM for an unknown
+ * phoneme name, or
  * TISPEECH_E_OUTOFMEMORY. On success `*out_samples` is owned by the library;
  * release it with tispeech_free_samples().
  */

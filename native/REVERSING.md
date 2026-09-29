@@ -537,9 +537,8 @@ Findings from this reconstruction:
 **Not covered.** The inline `{...}` command parser (`FUN_1c005180` and its
 helpers) is not reconstructed: `sv_narrate_sentence` returns
 `SV_NAR_E_NOTIMPL` on a `{`. The event-reporting block of the renderer is
-still skipped (it does not touch audio). The generator is written against
-TIENG32 addresses; driving TISPAN32 needs a VA relocation map. The English
-duration rules (`+0x04`) are per language; Spanish's are not ported.
+still skipped (it does not touch audio). Spanish: see "Spanish synthesis"
+below.
 
 ### English text front end — integrated (2026-09-28)
 
@@ -553,9 +552,8 @@ currently selects the ordinary flags=0 path. User dictionaries: see below.
 
 The English `.data` image and read-only `.text` tables are extracted even
 without TIBASE32, so text conversion does not require synthesis data. Each
-conversion owns a mutable language-state copy. Spanish retains its existing
-matcher-only path. The .NET build now supplies TIBASE32 when available, enabling
-English PCM synthesis through the managed bindings. `NativeTiSpeechBackend`
+conversion owns a mutable language-state copy. The .NET build now supplies
+TIBASE32 when available, enabling PCM synthesis through the managed bindings. `NativeTiSpeechBackend`
 plays it through `SystemPcmPlayer` (afplay on macOS, paplay/aplay on Linux),
 and OpenTalkIt selects it whenever the Windows host is unavailable.
 
@@ -617,8 +615,9 @@ Public ABI: `tispeech_userdict_load(bytes, size, &dict)` /
 `tispeech_userdict_free` and `tispeech_text_to_phonemes_ex(language, text,
 dict, out, size)`; managed `TiUserDictionary` and
 `NativeTiSpeechBackend.LoadUserDictionary(path)`, which applies to phoneme
-previews and speech. English only for now; a dictionary with Spanish returns
-`NOTIMPL`.
+previews and speech, in both languages (Spanish through
+`src/textphon_span.c`; `tools/verify_spanish.py` checks it against TISPAN32).
+Only a matcher-only Spanish build (no TIENG32) returns `NOTIMPL` for one.
 
 **Deliberate divergence.** The original's per-letter bucket index
 (`handle+0x28 + ch*4 - 0xfc`) is only valid for ASCII `A`-`Z`. Fifteen
@@ -665,8 +664,8 @@ capstone's mnemonic plus operand shape with immediates normalised, across a
 | `+0x08` | 120/120 |
 | `+0x0C` | 120/120 |
 
-Three of the four are the same function compiled twice. Only `+0x04` genuinely
-differs, and English `.text` is `0x48F40` against Spanish's `0xA590`, so the
+Three of the four *start* as the same function compiled twice. Only `+0x04`
+differs at the entry point, and English `.text` is `0x48F40` against Spanish's `0xA590`, so the
 English module carries a great deal of code the Spanish one does not —
 consistent with a larger dictionary or normaliser rather than a different
 front end.
@@ -697,6 +696,66 @@ be built independently or together; capabilities and language selection report
 exactly what was compiled. The managed build passes each available language
 DLL independently. `test_capi` exercises the UTF-8 boundary in either language,
 plus oracle-confirmed Spanish outputs.
+
+## Spanish synthesis — DONE, VERIFIED END TO END (2026-09-29)
+
+A 120-instruction window was not enough: diffing the whole `+0x08` call graph
+(recursive descent, jump tables followed, absolute addresses normalised) shows
+13 of its 17 functions identical and four with Spanish rules:
+
+| TIENG32 | TISPAN32 | Port |
+|---|---|---|
+| `0x1c204690` generator | `0x1c404020` | `sv_lang_generate`, branches marked `span` |
+| `0x1c201b80` formant targets | `0x1c4019c0` | `formant_targets_span` (own function) |
+| `0x1c2030b0` voicing targets | `0x1c402d00` | `voicing_targets_span` (own function) |
+| `0x1c249310` frication | `0x1c40a9e0` | `frication_targets`, branches marked `span` |
+
+Spanish treats `0x36` and `0x6c` as its glides where English special-cases
+`0x3f`, has its own stop loci and burst levels, drops English's
+post-release aspiration block, and in the frame loop wobbles a glide's
+formants on `frame & 3` and rescales the formants for voice type 1.
+
+The module globals are at a constant `0x1c1c50` from English's (BSS
+`0x1c411d96..0x1c416f53`) except for one Spanish-only dword, `0x1c412b28`
+("current phoneme is a glide", written by the formant function, read by the
+frame loop), which pushes `ATTR0`/`F10_0`/`+0xe0` up by four. langgen.c keeps
+it at `0x1c250ee4`, a gap English never touches, so the Spanish code uses
+English names throughout. Scratch tooling for this (not committed): a
+call-graph differ, a Spanish-to-English address map derived from aligned
+identical instructions, and a listing annotator that prints TISPAN32 code
+with langgen.c's names.
+
+One detail that is not in the rules: frication's fallback reads an
+uninitialised stack word that on every path holds voicing's saved `EBX`.
+English's is `0x4b`, Spanish's `0x19` (TISPAN32 loads its track-init
+constants into different registers).
+
+`src/duration_span.c` is TISPAN32's `+0x04`, and `src/textphon_span.c` its
+text front end, both against TISPAN32's own addresses.
+
+```sh
+python tools/verify_spanish.py --dlls /path/to/dlls \
+  --library build/libverify_frontend_span.dylib \
+  --narrate-library build/libverify_narrate_span.dylib --voices --random 400
+```
+
+compares every stage and the PCM against TISPAN32 under Unicorn; `--voices`
+repeats each text under all twenty personalities through `{voice ...}`, and
+`--random` adds pseudo-Spanish sentences built from every onset, glide,
+accent and coda. ctest `original_narrate_span` runs a smaller set.
+
+Widening the voices exposed two language-independent bugs that English's
+tests had never reached, both fixed:
+
+- **Flutter past frame 256** (`src/expression.c`). The counter's wrap at
+  `0x1c00c1a8` resets the table pointer, but the pointer's own increment is
+  at the bottom of the frame loop (`0x1c00c28a`), after the reset, so from the
+  first wrap on the pointer leads the counter by one and each lap reads the
+  noise table's first byte (`0x1c001570`). The extracted flutter blob is now
+  0x101 bytes.
+- **Voice table across sentences** (`src/narrate.c`). A `{voice}` command
+  stores its phoneme table back into the engine (`0x1c003eef`), so the next
+  sentence's parse starts with it; the port kept it local.
 
 ## Open questions
 
@@ -749,20 +808,21 @@ plus oracle-confirmed Spanish outputs.
 
 ## Not started
 
-The inline-command parser, Spanish's duration rules and generator
-relocation, and the `TIBASE32` public API beyond its declared surface.
+The `TIBASE32` public API beyond its declared surface.
 
 | Stage | Status |
 |---|---|
-| text → phonemes | English front end integrated (`src/textphon_eng.c`), including normalisation, exceptions, numbers and stress; Spanish matcher only |
-| phonemes → parameter frames | **reconstructed and verified sample-exact end to end** (`src/narrate.c`, `src/duration_eng.c`, `src/langgen.c`), English |
+| text → phonemes | English front end integrated (`src/textphon_eng.c`), including normalisation, exceptions, numbers and stress; Spanish (`src/textphon_span.c`) everything except numeric tokens, which return NOTIMPL (TISPAN32's cardinal-number grammar at `0x1C4073D0` is not ported) |
+| phonemes → parameter frames | **reconstructed and verified sample-exact end to end** (`src/narrate.c`, `src/duration_eng.c`, `src/duration_span.c`, `src/langgen.c`), English and Spanish |
 | parameter frames → PCM | reconstructed and verified bit-exact (`src/frames.c`, `src/dsp.c`) |
 | PCM → audio device | managed side: `SystemPcmPlayer` via `NativeTiSpeechBackend` (the original's waveOut layer is not reconstructed) |
 
 `tispeech_synthesize()` in `src/capi.c` now works: a SoftVoice phoneme string
 in, the original's exact 8-bit 11025 Hz PCM stream out, and
 `tispeech_capabilities()` reports `TISPEECH_CAP_SYNTHESIS` when the build has
-both TIBASE32 and TIENG32. `tools/svsay` writes it to a WAV file.
+both TIBASE32 and TIENG32; `tispeech_synthesis_languages()` adds Spanish when
+TISPAN32 is there too. `tools/svsay` writes it to a WAV file (`-s` Spanish).
+`verify_spanish.py --public-library` checks text to PCM through this ABI.
 
 ## Tooling
 

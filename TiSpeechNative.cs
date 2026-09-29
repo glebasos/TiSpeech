@@ -56,6 +56,10 @@ public static partial class TiSpeechNative
     private static partial uint NativeLanguages();
 
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    [LibraryImport(LibraryName, EntryPoint ="tispeech_synthesis_languages")]
+    private static partial uint NativeSynthesisLanguages();
+
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     [LibraryImport(LibraryName, EntryPoint ="tispeech_build_info")]
     private static partial IntPtr NativeBuildInfo();
 
@@ -245,6 +249,7 @@ public static partial class TiSpeechNative
         string? UnavailableDetail,
         TiEngineCapabilities Capabilities,
         TiLanguageFlags Languages,
+        TiLanguageFlags SynthesisLanguages,
         string? BuildInfo,
         string? LibraryPath);
 
@@ -260,14 +265,21 @@ public static partial class TiSpeechNative
             var caps = (TiEngineCapabilities)NativeCapabilities();
             var langs = (TiLanguageFlags)NativeLanguages();
             var info = Marshal.PtrToStringUTF8(NativeBuildInfo());
-            return new ProbeResult(true, null, null, caps, langs, info, _resolvedPath);
+            TiLanguageFlags synth;
+            try { synth = (TiLanguageFlags)NativeSynthesisLanguages(); }
+            catch (EntryPointNotFoundException)
+            {
+                // Libraries from before the export synthesized English only.
+                synth = caps.HasFlag(TiEngineCapabilities.Synthesis) ? TiLanguageFlags.English : 0;
+            }
+            return new ProbeResult(true, null, null, caps, langs, synth, info, _resolvedPath);
         }
         catch (Exception ex) when (ex is DllNotFoundException
                                       or EntryPointNotFoundException
                                       or BadImageFormatException)
         {
             return new ProbeResult(false, DescribeLoadFailure(ex), DescribeProbedPaths(),
-                                   TiEngineCapabilities.None, 0, null, null);
+                                   TiEngineCapabilities.None, 0, 0, null, null);
         }
     }
 
@@ -344,6 +356,12 @@ public static partial class TiSpeechNative
     public static TiLanguageFlags Languages => LazyProbe.Value.Languages;
 
     /// <summary>
+    /// Languages <see cref="Synthesize"/> accepts (<c>tispeech_synthesis_languages()</c>):
+    /// English with TIBASE32 and TIENG32, Spanish with TISPAN32 as well.
+    /// </summary>
+    public static TiLanguageFlags SynthesisLanguages => LazyProbe.Value.SynthesisLanguages;
+
+    /// <summary>
     /// The library's own one-line description of itself
     /// (<c>tispeech_build_info()</c>), or null when it is not loaded.
     /// </summary>
@@ -358,11 +376,12 @@ public static partial class TiSpeechNative
         && (Languages & (TiLanguageFlags)(uint)language) != 0;
 
     /// <summary>
-    /// Text-to-phoneme conversion on macOS, Linux and Windows. English uses
-    /// the reconstructed normaliser, exception dictionary and stress rules;
-    /// Spanish currently uses letter-to-sound rules only. A
-    /// <paramref name="dictionary"/> is consulted first, as SVTextToPhon does
-    /// (English only). English accepts at most 514 Latin-1 characters.
+    /// Text-to-phoneme conversion on macOS, Linux and Windows. English and
+    /// Spanish use the reconstructed normaliser, exception dictionary and
+    /// stress rules (Spanish needs TIENG32 as well as TISPAN32 at build time,
+    /// otherwise letter-to-sound rules only; Spanish numbers are not
+    /// reconstructed). A <paramref name="dictionary"/> is consulted first, as
+    /// SVTextToPhon does. At most 514 Latin-1 characters per call.
     /// </summary>
     public static TiPhonemeResult TextToPhonemes(TiLanguage language, string text,
         TiUserDictionary? dictionary = null)
@@ -392,9 +411,9 @@ public static partial class TiSpeechNative
                     "Only Latin-1 text can be converted.");
         }
 
-        if (language == TiLanguage.English && text.Length > 514)
+        if (language is TiLanguage.English or TiLanguage.Spanish && text.Length > 514)
             return TiPhonemeResult.Failure(TiStatus.BadParam,
-                "English conversion currently supports at most 514 characters per call. " +
+                $"{language} conversion currently supports at most 514 characters per call. " +
                 "Split the text into shorter passages.");
 
         if (string.IsNullOrWhiteSpace(text))
@@ -469,6 +488,8 @@ public static partial class TiSpeechNative
         TiStatus.NoLanguage =>
             $"No {language} letter-to-sound data in this build of the TiSpeech native library " +
             $"(it has: {DescribeLanguages(Languages)}).",
+        TiStatus.NotImplemented when language == TiLanguage.Spanish =>
+            "Spanish number reading is not reconstructed yet; spell numbers out as words.",
         _ => status.Describe(),
     };
 
@@ -486,8 +507,8 @@ public static partial class TiSpeechNative
     /// <summary>
     /// Phoneme-to-PCM synthesis (<c>tispeech_synthesize</c>).
     ///
-    /// English synthesis uses the original default voice when base and English
-    /// data were supplied at build time. Unsupported commands and builds without
+    /// Uses the original default voice for any language in
+    /// <see cref="SynthesisLanguages"/>. Unsupported commands and builds without
     /// synthesis data return <see cref="TiStatus.NotImplemented"/>.
     /// </summary>
     public static TiSynthesisResult Synthesize(TiLanguage language, string phonemes, TiVoiceOptions? options = null)
@@ -548,13 +569,16 @@ public static partial class TiSpeechNative
             finally { NativeFreeSamples(samples); }
         }
     }
-    /// <summary>Convert ordinary English text and synthesize the resulting phonemes.</summary>
+    /// <summary>Convert ordinary text and synthesize the resulting phonemes.</summary>
     public static TiSynthesisResult SynthesizeText(TiLanguage language, string text, TiVoiceOptions? options = null,
         TiUserDictionary? dictionary = null)
     {
-        if (language != TiLanguage.English)
+        if (!IsAvailable)
+            return TiSynthesisResult.Failure(TiStatus.LibraryUnavailable, UnavailableReason);
+        if ((SynthesisLanguages & (TiLanguageFlags)(uint)language) == 0)
             return TiSynthesisResult.Failure(TiStatus.NoLanguage,
-                "Native speech currently supports English. Spanish phoneme previews remain available.");
+                $"Native speech is built for {DescribeLanguages(SynthesisLanguages)} only; " +
+                $"{language} phoneme previews may still be available.");
         var phonemes = TextToPhonemes(language, text, dictionary);
         if (!phonemes.IsSuccess)
             return TiSynthesisResult.Failure(phonemes.Status, phonemes.Message);

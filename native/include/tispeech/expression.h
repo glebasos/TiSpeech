@@ -92,8 +92,13 @@ extern "C" {
 
 enum {
     /* 0x1c001470, read one signed byte per frame and wrapped every 256
-     * (0x1c00c1a8). Sits immediately before the noise table at 0x1c001570. */
+     * (0x1c00c1a8). Sits immediately before the noise table at 0x1c001570.
+     * The wrap resets the read pointer and then the frame loop advances it
+     * anyway (0x1c00c28a), so from frame 256 on the pointer runs one byte
+     * ahead of the counter and reaches 0x1c001570 once per lap: the table
+     * blob is SV_EXPR_FLUTTER_READ bytes. */
     SV_EXPR_FLUTTER_BYTES = 0x100,
+    SV_EXPR_FLUTTER_READ = 0x101,
 
     /* 0x1c013430, read as an int16 at an EVEN byte offset derived from a
      * 13-bit phase (0x1c00c02f: `shr ax,5` then `and eax,-2`), so the reachable
@@ -117,7 +122,7 @@ enum {
 };
 
 typedef struct sv_expr_tables {
-    const uint8_t *flutter;     /* SV_EXPR_FLUTTER_BYTES, read as int8   */
+    const uint8_t *flutter;     /* SV_EXPR_FLUTTER_READ, read as int8    */
     const uint8_t *lfo;         /* SV_EXPR_LFO_BYTES, read as LE int16   */
     const uint8_t *voices;      /* SV_EXPR_VOICE_ROWS rows               */
     const uint8_t *source_map;  /* SV_EXPR_SOURCE_MAP_BYTES              */

@@ -275,6 +275,7 @@ int sv_langmod_init(sv_langmod *m, const sv_image *lang, const uint32_t desc[10]
 
 /* English vtable +0x04, src/duration_eng.c. */
 int sv_eng_duration(struct sv_engine *e);
+int sv_span_duration(struct sv_engine *e);
 
 /* Vtable +0x08, src/langgen.c: give a module its generator. `data` is the
  * module's .data image (copied: the generator's state lives in it) and

@@ -12,6 +12,9 @@
 #include "tispeech/narrate.h"
 #include "tispeech/ruleset.h"
 #include "tispeech/userdict.h"
+#ifdef TISPEECH_HAVE_FRONTEND_SPAN
+#  include "tispeech/textphon_span.h"
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -35,7 +38,8 @@ uint32_t tispeech_capabilities(void)
         caps |= TISPEECH_CAP_TEXT_TO_PHONEMES;
 #ifdef TISPEECH_HAVE_SYNTH_ENG
     /* Phoneme string -> PCM, verified sample-exact against the original
-     * engine (tools/verify_narrate.py). English only. */
+     * engine (tools/verify_narrate.py, tools/verify_spanish.py). Which
+     * languages: tispeech_synthesis_languages(). */
     caps |= TISPEECH_CAP_SYNTHESIS;
 #endif
     return caps;
@@ -46,7 +50,25 @@ uint32_t tispeech_languages(void)
     return (uint32_t)TISPEECH_LANGS_BUILT;
 }
 
+#ifdef TISPEECH_HAVE_SYNTH_SPAN
+#  define TISPEECH_SYNTH_SPAN_BUILT TISPEECH_LANG_SPANISH
+#else
+#  define TISPEECH_SYNTH_SPAN_BUILT 0u
+#endif
 #ifdef TISPEECH_HAVE_SYNTH_ENG
+#  define TISPEECH_SYNTH_BUILT (TISPEECH_LANG_ENGLISH | TISPEECH_SYNTH_SPAN_BUILT)
+#else
+#  define TISPEECH_SYNTH_BUILT 0u
+#endif
+
+uint32_t tispeech_synthesis_languages(void)
+{
+    return (uint32_t)TISPEECH_SYNTH_BUILT;
+}
+
+#if defined(TISPEECH_HAVE_SYNTH_SPAN)
+#  define SYNTH_INFO "synthesis: English, Spanish"
+#elif defined(TISPEECH_HAVE_SYNTH_ENG)
 #  define SYNTH_INFO "synthesis: English"
 #else
 #  define SYNTH_INFO "synthesis: not built (needs TIBASE32 and TIENG32)"
@@ -54,7 +76,10 @@ uint32_t tispeech_languages(void)
 
 const char *tispeech_build_info(void)
 {
-#if defined(TISPEECH_HAVE_ENG) && defined(TISPEECH_HAVE_SPAN)
+#if defined(TISPEECH_HAVE_FRONTEND_SPAN)
+    return "tispeech native reconstruction; text front end: English, Spanish; "
+           SYNTH_INFO;
+#elif defined(TISPEECH_HAVE_ENG) && defined(TISPEECH_HAVE_SPAN)
     return "tispeech native reconstruction; text front end: English; letter-to-sound: Spanish; "
            SYNTH_INFO;
 #elif defined(TISPEECH_HAVE_ENG)
@@ -137,23 +162,81 @@ extern const uint32_t sv_eng_image_va, sv_eng_image_size;
 extern const uint32_t sv_eng_image_desc[10];
 extern const sv_image sv_eng_image_text[];
 extern const size_t sv_eng_image_text_count;
+#endif
+#ifdef TISPEECH_HAVE_FRONTEND_SPAN
+extern const uint8_t sv_span_image[];
+extern const uint32_t sv_span_image_va, sv_span_image_size;
+extern const uint32_t sv_span_desc_image_desc[10];
+extern const sv_image sv_span_image_text[];
+extern const size_t sv_span_image_text_count;
+#endif
 
-static int32_t text_to_phonemes_eng(const char *text, const sv_userdict_t *dict,
-                                     char *out, int32_t size)
+/* Languages with a reconstructed front end (SVTextToPhon plus the module's
+ * word translator); the others fall back to the letter-to-sound matcher. */
+static int has_frontend(uint32_t language)
+{
+#ifdef TISPEECH_HAVE_ENG
+    if (language == TISPEECH_LANG_ENGLISH)
+        return 1;
+#endif
+#ifdef TISPEECH_HAVE_FRONTEND_SPAN
+    if (language == TISPEECH_LANG_SPANISH)
+        return 1;
+#endif
+    (void)language;
+    return 0;
+}
+
+#if defined(TISPEECH_HAVE_ENG) || defined(TISPEECH_HAVE_FRONTEND_SPAN)
+/* LoadLanguage for one module, with its generator and duration rules.
+ * sv_langgen_detach() releases it. */
+static int32_t lang_open(uint32_t language, sv_langmod *m)
+{
+    memset(m, 0, sizeof *m);
+#ifdef TISPEECH_HAVE_ENG
+    if (language == TISPEECH_LANG_ENGLISH) {
+        sv_image li = {sv_eng_image, sv_eng_image_va, sv_eng_image_size};
+        if (sv_langmod_init(m, &li, sv_eng_image_desc))
+            return TISPEECH_E_NOLANGUAGE;
+        m->duration = sv_eng_duration;
+        return sv_langgen_attach(m, &li, sv_eng_image_text, sv_eng_image_text_count)
+            ? TISPEECH_E_OUTOFMEMORY : TISPEECH_OK;
+    }
+#endif
+#ifdef TISPEECH_HAVE_FRONTEND_SPAN
+    if (language == TISPEECH_LANG_SPANISH) {
+        sv_image li = {sv_span_image, sv_span_image_va, sv_span_image_size};
+        if (sv_langmod_init(m, &li, sv_span_desc_image_desc))
+            return TISPEECH_E_NOLANGUAGE;
+        m->duration = sv_span_duration;
+        return sv_langgen_attach(m, &li, sv_span_image_text, sv_span_image_text_count)
+            ? TISPEECH_E_OUTOFMEMORY : TISPEECH_OK;
+    }
+#endif
+    return TISPEECH_E_NOLANGUAGE;
+}
+
+static int32_t text_to_phonemes_frontend(uint32_t language, const char *text,
+                                         const sv_userdict_t *dict,
+                                         char *out, int32_t size)
 {
     /* SVTextToPhon silently emits nothing above 0x202 input bytes. Expose
      * an explicit limit rather than reporting a successful empty conversion. */
     if (strlen(text) > 0x202)
         return TISPEECH_E_BADPARAM;
-    sv_image li = {sv_eng_image, sv_eng_image_va, sv_eng_image_size};
-    sv_langmod eng = {0};
+    sv_langmod m;
     char *phonemes = NULL;
-    if (sv_langmod_init(&eng, &li, sv_eng_image_desc))
-        return TISPEECH_E_NOLANGUAGE;
-    if (sv_langgen_attach(&eng, &li, sv_eng_image_text, sv_eng_image_text_count))
-        return TISPEECH_E_OUTOFMEMORY;
-    int32_t rc = sv_tts_phonemes_ex(&eng, text, 0, dict, &phonemes);
-    sv_langgen_detach(&eng);
+    int32_t rc = lang_open(language, &m);
+    if (rc != TISPEECH_OK)
+        return rc;
+#ifdef TISPEECH_HAVE_FRONTEND_SPAN
+    if (language == TISPEECH_LANG_SPANISH)
+        /* SV_NAR_E_NOTIMPL (== TISPEECH_E_NOTIMPL) for a numeric token. */
+        rc = sv_tts_phonemes_span_ex(&m, text, 0, dict, &phonemes);
+    else
+#endif
+        rc = sv_tts_phonemes_ex(&m, text, 0, dict, &phonemes);
+    sv_langgen_detach(&m);
     if (rc == 0) {
         size_t n = strlen(phonemes);
         if (n >= (size_t)size)
@@ -216,23 +299,19 @@ int32_t tispeech_text_to_phonemes_ex(uint32_t language, const char *text,
     rules = ruleset_for(language);
     if (rules == NULL)
         return TISPEECH_E_NOLANGUAGE;
-    /* The dictionary lookup lives in the reconstructed English front end;
-     * the matcher-only path has nowhere to consult it. */
-    if (dict != NULL) {
-#ifdef TISPEECH_HAVE_ENG
-        if (language != TISPEECH_LANG_ENGLISH)
-#endif
-            return TISPEECH_E_NOTIMPL;
-    }
+    /* The dictionary lookup lives in the reconstructed front ends; the
+     * matcher-only path has nowhere to consult it. */
+    if (dict != NULL && !has_frontend(language))
+        return TISPEECH_E_NOTIMPL;
 
-    status = normalise(text, &work, language == TISPEECH_LANG_ENGLISH);
+    status = normalise(text, &work, has_frontend(language));
     if (status != TISPEECH_OK)
         return status;
 
-#ifdef TISPEECH_HAVE_ENG
-    if (language == TISPEECH_LANG_ENGLISH) {
-        status = text_to_phonemes_eng(work, (const sv_userdict_t *)dict,
-                                      out, out_size);
+#if defined(TISPEECH_HAVE_ENG) || defined(TISPEECH_HAVE_FRONTEND_SPAN)
+    if (has_frontend(language)) {
+        status = text_to_phonemes_frontend(language, work, (const sv_userdict_t *)dict,
+                                           out, out_size);
         free(work);
         return status;
     }
@@ -323,32 +402,30 @@ static int32_t narrate_status(int rc)
 }
 
 /* One utterance on a fresh engine: SVOpenSpeech's defaults (voice row 0,
- * English, the primary phoneme table) and SVNarrate's sentence loop. */
-static int32_t synthesize_eng(const char *phonemes, const tispeech_voice_options *options,
-                              struct pcm_buffer *out)
+ * the language's primary phoneme table) and SVNarrate's sentence loop. */
+static int32_t synthesize_lang(uint32_t language, const char *phonemes,
+                               const tispeech_voice_options *options,
+                               struct pcm_buffer *out)
 {
     sv_image bi = {sv_base_image, sv_base_image_va, sv_base_image_size};
-    sv_image li = {sv_eng_image, sv_eng_image_va, sv_eng_image_size};
     sv_nar_tables tables;
     sv_langmod eng;
-    sv_engine *e = calloc(1, sizeof *e);
-    int32_t status = TISPEECH_OK;
-    memset(&eng, 0, sizeof eng);
-    if (!e)
-        return TISPEECH_E_OUTOFMEMORY;
-    if (sv_nar_tables_init(&tables, &bi) || sv_langmod_init(&eng, &li, sv_eng_image_desc)) {
-        free(e);
+    int32_t status;
+    if (sv_nar_tables_init(&tables, &bi))
         return TISPEECH_E_NOLANGUAGE;
-    }
-    eng.duration = sv_eng_duration;
-    if (sv_langgen_attach(&eng, &li, sv_eng_image_text, sv_eng_image_text_count)) {
-        free(e);
+    status = lang_open(language, &eng);
+    if (status != TISPEECH_OK)
+        return status;
+    sv_engine *e = calloc(1, sizeof *e);
+    if (!e) {
+        sv_langgen_detach(&eng);
         return TISPEECH_E_OUTOFMEMORY;
     }
     e->base = &tables;
     e->frame_tables = &sv_base_tables;
     e->expr_tables = &sv_base_tables_expression;
-    e->modules[0] = &eng;
+    /* TIBASE32 0x1c012038: a module's slot is its language id - 1. */
+    e->modules[eng.id - 1] = &eng;
     e->lang = &eng;
     e->lang_primary = &eng;
     e->phonemes = eng.phonemes_a;
@@ -436,14 +513,14 @@ int32_t tispeech_synthesize_ex(uint32_t language, const char *phonemes,
         || !valid_override(options->glottal_source, 0, 8)))
         return TISPEECH_E_BADPARAM;
 #ifdef TISPEECH_HAVE_SYNTH_ENG
-    if (language != TISPEECH_LANG_ENGLISH)
+    if ((language & TISPEECH_SYNTH_BUILT) == 0 || (language & (language - 1)) != 0)
         return TISPEECH_E_NOLANGUAGE;
     /* The phoneme alphabet is 7-bit. */
     for (const char *p = phonemes; *p; p++)
         if ((unsigned char)*p >= 0x80)
             return TISPEECH_E_BADPARAM;
     struct pcm_buffer b = {NULL, 0, 0, 0};
-    int32_t status = synthesize_eng(phonemes, options, &b);
+    int32_t status = synthesize_lang(language, phonemes, options, &b);
     if (status != TISPEECH_OK || b.n > INT32_MAX) {
         free(b.data);
         return status != TISPEECH_OK ? status : TISPEECH_E_OUTOFMEMORY;

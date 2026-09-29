@@ -1,9 +1,13 @@
 /*
  * langgen.c — the language module's frame generator, vtable slot +0x08.
  *
- * TIENG32!0x1c204690 and everything it calls. TISPAN32's +0x08 is the same
- * code compiled at other addresses (REVERSING.md), so this is written against
- * the English addresses and used for both.
+ * TIENG32!0x1c204690 and everything it calls, written against the English
+ * addresses and used for both languages. TISPAN32's +0x08 (0x1c404020) is
+ * the same program with Spanish rules in four places: formant targets
+ * (formant_targets_span), voicing targets (voicing_targets_span), frication
+ * and the frame loop (both marked `span`). Its globals sit at a constant
+ * 0x1c1c50 from English's except one extra flag (GLIDE), so the Spanish code
+ * uses the English names; tools/extract_span_frontend.py builds the image.
  *
  * HOW THIS FILE IS WRITTEN
  * ------------------------
@@ -31,6 +35,8 @@
 #include <string.h>
 
 #include "langmod_priv.h"
+
+#define SV_LANG_SPANISH 2   /* sv_langmod.id, as svapi.h numbers languages */
 
 /* Native frames, by byte offset from a frame pointer. */
 #define FB(p, off) (((uint8_t *)(p))[(off)])
@@ -691,6 +697,374 @@ after_glide:
     }
 }
 
+/* Spanish only: set when the current phoneme is the glide 0x36 or 0x6c
+ * (TISPAN32 0x1c412b28, a global English does not have; placed in an unused
+ * gap of the English layout). The frame loop wobbles its formants. */
+#define GLIDE L(0x1c250ee4)
+#define IS_GLIDE(c) ((c) == 0x36 || (c) == 0x6c)
+
+/* TISPAN32 0x1c4019c0: Spanish formant targets. The skeleton is English's
+ * (same target loading, pause holds, spacing, nasal bandwidths and
+ * transition table); the coarticulation rules around it are Spanish's own. */
+static void formant_targets_span(sv_engine *e, const sv_record *cur)
+{
+    const uint8_t *ph = cur->phonemes;
+    if ((ATTR2 & 0x10002000u) && !(ATTR2 & 0x10)) {
+        FB6(T(trk, 0x38) = 0);
+        FB6(T(trk, 0x3c) = 0x64);
+    }
+    track_shift(e, F1);
+    track_shift(e, B1);
+    track_shift(e, F2);
+    track_shift(e, B2);
+    track_shift(e, F3);
+    track_shift(e, B3);
+
+    unsigned code = (CODE3 == 0x4b || CODE3 == 0x4c) ? CODE4 : CODE3;
+    const uint8_t *def = ph + code * SV_PH_STRIDE;
+#define DEF(off) ((int32_t)(int16_t)sv_rd16(def + (off)))
+    T(F1, 0x18) = DEF(0x06);
+    T(B1, 0x18) = DEF(0x0c);
+    T(F2, 0x18) = DEF(0x08);
+    T(B2, 0x18) = DEF(0x0e);
+    T(F3, 0x18) = DEF(0x0a);
+    T(B3, 0x18) = DEF(0x10);
+    if (ATTR3 & 0x10) {
+        T(F1, 0x1c) = DEF(0x20);
+        T(B1, 0x1c) = DEF(0x26);
+        T(F2, 0x1c) = DEF(0x22);
+        T(B2, 0x1c) = DEF(0x28);
+        T(F3, 0x1c) = DEF(0x24);
+        T(B3, 0x1c) = DEF(0x2a);
+    } else {
+        FB6(T(trk, 0x1c) = T(trk, 0x18));
+    }
+    if (CODE3 == 0x4b || CODE3 == 0x4c) {
+        int32_t v = DEF(0x0c) + 0xc8;
+        T(B1, 0x1c) = v;
+        T(B1, 0x18) = v;
+        v = DEF(0x0e) + 0x28;
+        if (v <= 0xc8)
+            v = 0xc8;
+        T(B2, 0x1c) = v;
+        T(B2, 0x18) = v;
+        v = DEF(0x10) + 0x3c;
+        if (v <= 0x12c)
+            v = 0x12c;
+        T(B3, 0x1c) = v;
+        T(B3, 0x18) = v;
+        if (!(ATTR2 & 0x20000000u)) {
+            T(F1, 0x18) = (T(F1, 0x1c) + T(F1, 0x0c)) >> 1;
+            T(F2, 0x18) = (T(F2, 0x0c) + T(F2, 0x1c)) >> 1;
+            T(F3, 0x18) = (T(F3, 0x1c) + T(F3, 0x0c)) >> 1;
+        }
+    }
+#undef DEF
+    if (ATTR3 & 0x20000000u)
+        FB6(T(trk, 0x18) = T(trk, 0x0c));
+    if (ATTR2 & 0x20000000u) {
+        T(F1, 0x0c) = T(F1, 0x18);
+        T(B1, 0x0c) = T(B1, 0x1c);
+        T(F2, 0x0c) = T(F2, 0x18);
+        T(B2, 0x0c) = T(B2, 0x1c);
+        T(F3, 0x0c) = T(F3, 0x18);
+        T(B3, 0x0c) = T(B3, 0x1c);
+    }
+
+    if (ATTR3 & 0x10000000u) {
+        if ((ATTR3 & 0x80) && (ATTR3 & 0x1000) && (ATTR4 & 0x4000000u))
+            T(F2, 0x1c) = T(F2, 0x18);
+        if ((ATTR3 & 0x40000080u) && (ATTR4 & 0x800))
+            T(F2, 0x1c) -= 0x12c;
+        if ((ATTR3 & 0x40000000u) && (ATTR4 & 2))
+            T(F2, 0x1c) -= 0x96;
+        if (IS_GLIDE(CODE2)) {
+            /* 0x1c401d2c: F3 toward the glide's own (phoneme 0x36). */
+            if (ATTR2 & 0x200000u)
+                T(F3, 0x18) = ph16(ph, 0x36, 0xa);
+            else
+                T(F3, 0x18) = (ph16(ph, 0x36, 0xa) + T(F3, 0x18)) >> 1;
+        }
+        if (CODE3 == 0x11 && F10_3 == 0) {
+            T(F1, 0x18) = 0x294; T(F1, 0x1c) = 0x294;
+            T(F2, 0x18) = 0x514; T(F2, 0x1c) = 0x514;
+            T(F3, 0x18) = 0x960; T(F3, 0x1c) = 0x960;
+        }
+    } else if ((ATTR3 & 0x40) && (ATTR3 & 0x10000) && (ATTR4 & 0x10000000u) &&
+               (ATTR4 & 0x200000u)) {
+        T(F2, 0x18) -= 0x32;
+        T(F3, 0x18) -= 0xc8;
+        T(F2, 0x1c) = T(F2, 0x18);
+        T(F3, 0x1c) = T(F3, 0x18);
+    }
+
+    if ((ATTR3 & 2) && (ATTR2 & 0x180000u)) {
+        T(F2, 0x1c) = 0x73a; T(F2, 0x18) = 0x73a;
+        T(F3, 0x1c) = 0x898; T(F3, 0x18) = 0x898;
+    }
+    uint32_t r_edx = ATTR3 & 0x4000000u;
+    if (r_edx && (ATTR2 & 0x180000u)) {
+        T(F2, 0x1c) = 0x6a4; T(F2, 0x18) = 0x6a4;
+        T(F3, 0x1c) = 0x76c; T(F3, 0x18) = 0x76c;
+    }
+    if (r_edx && (ATTR2 & 0x80000000u)) {
+        T(F2, 0x1c) = 0x384; T(F2, 0x18) = 0x384;
+        T(F3, 0x1c) = 0x9c4; T(F3, 0x18) = 0x9c4;
+    }
+    if (CODE3 == 0x37) {
+        if ((ATTR4 & 0x800000u) && !(ATTR4 & 0x8000u)) {
+            int32_t v = (ph16(ph, CODE4, 8) + T(F2, 0x18) * 9) / 10;
+            T(F2, 0x1c) = v;
+            T(F2, 0x18) = v;
+        }
+        if (!(ATTR4 & 0x800000u) || (ATTR4 & 0x8000u)) {
+            int32_t v = (T(F2, 0x18) * 9 + 0x91) / 10;
+            T(F2, 0x1c) = v;
+            T(F2, 0x18) = v;
+        }
+        if (ATTR4 & 0x200000u) {
+            T(F1, 0x1c) -= 0x64;
+            T(F2, 0x1c) -= 0x64;
+        }
+    }
+    if (IS_GLIDE(CODE3)) {
+        if (!(ATTR2 & 0x200000u))
+            T(F3, 0x18) = T(F3, 0x08);
+        if (!(ATTR4 & 0x200000u))
+            T(F3, 0x1c) = ph16(ph, CODE4, 0xa);
+    }
+    if (CODE3 == 0x40) {
+        int32_t v = (ph16(ph, CODE4, 6) + T(F1, 0x0c)) >> 1;
+        T(F1, 0x1c) = v;
+        T(F1, 0x18) = v;
+        v = (ph16(ph, CODE4, 8) + T(F2, 0x0c)) >> 1;
+        T(F2, 0x1c) = v;
+        T(F2, 0x18) = v;
+        v = (ph16(ph, CODE4, 0xa) + T(F3, 0x0c)) >> 1;
+        T(F3, 0x1c) = v;
+        T(F3, 0x18) = v;
+    }
+    if (CODE3 == 0x3e && (ATTR2 & 0x40000080u)) {
+        T(F2, 0x1c) = T(F2, 0x18);
+        T(F3, 0x1c) = T(F3, 0x18);
+        T(F1, 0x18) -= 0x64;
+        T(F1, 0x1c) = T(F1, 0x18);
+    }
+    if (T(F3, 0x18) - T(F2, 0x18) < 0xfa)
+        T(F2, 0x18) = T(F3, 0x18) - 0xfa;
+    if (T(F3, 0x1c) - T(F2, 0x1c) < 0xfa)
+        T(F2, 0x1c) = T(F3, 0x1c) - 0xfa;
+    if (T(F2, 0x18) - T(F1, 0x18) < 0xc8)
+        T(F1, 0x18) = T(F2, 0x18) - 0xc8;
+    if (T(F2, 0x1c) - T(F1, 0x1c) < 0xc8)
+        T(F1, 0x1c) = T(F2, 0x1c) - 0xc8;
+
+    nasal_bandwidths(e);
+
+    uint32_t r_esp10 = ATTR3 & 0x10002000u;
+    if (r_esp10) {
+        if (ATTR4 & 0x8000u) {
+            T(B1, 0x1c) += 0x64;
+            T(B2, 0x1c) += 0x32;
+            T(B3, 0x1c) += 0x32;
+            T(F1, 0x1c) = (T(F1, 0x1c) + 0x1f4) >> 1;
+        }
+        if (ATTR2 & 0x8000u) {
+            T(B1, 0x18) += 0x64;
+            T(B2, 0x18) += 0x32;
+            T(B3, 0x18) += 0x32;
+            T(F1, 0x18) = (T(F1, 0x18) + 0x1f4) >> 1;
+        }
+    }
+
+    W(0x1c250562) = W(0x1c25055a);
+    uint32_t r_ebx = ATTR3 & 0x10000000u;
+    if (r_ebx)
+        W(0x1c25055a) = 0;
+    else if (ATTR3 & 0x1000000u)
+        W(0x1c25055a) = 1;
+    else if (ATTR3 & 0x40)
+        W(0x1c25055a) = 2;
+    else
+        W(0x1c25055a) = 3;
+    {
+        int32_t v = B(0x1c24c3f0 + W(0x1c25055a) + W(0x1c250562) * 4);
+        FB6(T(trk, 0x28) = v);
+    }
+    if (CODE2 == 0x37)
+        FB6(T(trk, 0x28) = 0x14);
+    uint32_t r_edi = ATTR2 & 0x10000000u;
+    if (r_edi && (ATTR3 & 0x800))
+        FB6(T(trk, 0x28) = 0x14);
+    if (r_edi && (ATTR3 & 0x1000000u)) {
+        T(B1, 0x28) = 0x41; T(F1, 0x28) = 0x41;
+        T(B2, 0x28) = 0x32; T(F2, 0x28) = 0x32; T(B3, 0x28) = 0x32; T(F3, 0x28) = 0x32;
+    }
+    if (r_edi && IS_GLIDE(CODE3)) {
+        T(F1, 0x28) = (ATTR2 & 0x80) ? 0x64 : 0x1e;
+        T(F2, 0x28) = 0x50;
+        T(F3, 0x28) = 0x32;
+        T(B3, 0x28) = 0x14; T(B2, 0x28) = 0x14; T(B1, 0x28) = 0x14;
+    }
+    if (IS_GLIDE(CODE2)) {
+        T(F1, 0x28) = (ATTR1 & 0x80) ? 0 : 0x46;
+        T(F3, 0x28) = 0x32;
+        T(F2, 0x28) = 0x14;
+        T(B3, 0x28) = 0x14; T(B2, 0x28) = 0x14; T(B1, 0x28) = 0x14;
+    }
+    uint32_t r_ecx = ATTR2 & 0x800000u;
+    if (r_ecx && (ATTR3 & 0x40)) {
+        T(B1, 0x28) = 0x5a; T(F1, 0x28) = 0x5a;
+    } else if ((ATTR2 & 0x40) && (ATTR3 & 0x800000u)) {
+        T(B1, 0x28) = 0xa; T(F1, 0x28) = 0xa;
+    }
+    if (ATTR3 & 0x20000000u) {
+        T(F3, 0x28) = 0; T(F2, 0x28) = 0; T(F1, 0x28) = 0;
+        T(B3, 0x28) = 0x32; T(B2, 0x28) = 0x32; T(B1, 0x28) = 0x32;
+    }
+    if (ATTR2 & 0x20000000u) {
+        T(F3, 0x28) = 0x64; T(F2, 0x28) = 0x64; T(F1, 0x28) = 0x64;
+    }
+    if (r_edi && (ATTR3 & 0x4000000u))
+        T(F2, 0x28) = 0x50;
+    else if ((ATTR2 & 0x4000000u) && r_ebx)
+        T(F2, 0x28) = 0x1e;
+    if (r_ecx && CODE3 == 0x1e)
+        FB6(T(trk, 0x28) = 0x5a);
+    uint32_t r_esi = ATTR2 & 0x80000u;
+    {
+        int32_t v = -1;
+        if (r_esi && (ATTR3 & 0x8000u))
+            v = 0xa;
+        else if ((ATTR2 & 0x8000u) && (ATTR3 & 0x80000u))
+            v = 0x5a;
+        if (v >= 0) {
+            T(F3, 0x28) = v; T(F2, 0x28) = v; T(B3, 0x28) = v; T(B2, 0x28) = v;
+        }
+    }
+    if ((ATTR2 & 0xc0100000u) && (ATTR3 & 0x2000))
+        FB6(T(trk, 0x28) = 0x14);
+
+    FB6(T(trk, 0x24) = T(trk, 0x0c) + (T(trk, 0x18) - T(trk, 0x0c)) * T(trk, 0x28) / 100);
+
+    if ((ATTR1 & 2) && r_ecx) {
+        T(F2, 0x20) = 0x640;
+        T(F3, 0x20) = r_esi ? 0x8fc : 0xa28;
+    }
+    if ((ATTR2 & 2) && (ATTR3 & 0x800000u))
+        T(F3, 0x24) = (ATTR3 & 0x80000u) ? 0x8fc : 0xa3c;
+    r_esi = ATTR2 & 0x10002000u;
+    if (r_esi && (ATTR3 & 0x4000000u)) {
+        T(B1, 0x24) += 0x64;
+        T(F2, 0x24) = (T(F3, 0x0c) + T(F2, 0x18) + T(F2, 0x0c)) / 3 - 0x190;
+    }
+    uint32_t r_eax = ATTR3 & 0x4000000u;
+    if (r_eax && (ATTR2 & 0x40000080u))
+        T(F2, 0x24) += 0x64;
+    r_edx = ATTR2 & 0x4000000u;
+    if (r_edx && (ATTR3 & 0x40000080u))
+        T(F2, 0x24) += 0x64;
+    if (r_edx)
+        T(F3, 0x24) = T(F2, 0x24) + ((ATTR3 & 0x400) ? 0x320 : 0x190);
+    if (r_eax)
+        T(F3, 0x24) = T(F2, 0x24) + ((ATTR2 & 0x400) ? 0x320 : 0x258);
+    if ((ATTR2 & 0x800) && r_ebx) {
+        T(F1, 0x24) -= 0x3c;
+        T(F2, 0x24) -= 0x32;
+    } else if (r_edi && (ATTR1 & 0x800)) {
+        T(F1, 0x20) += 0x64;
+        T(F2, 0x20) += 0x64;
+    }
+    if ((ATTR2 & 0x20000100u) && CODE2 != 0x40) {
+        T(F1, 0x20) = T(F1, 0x08);
+        T(F2, 0x20) = T(F2, 0x08);
+        T(F3, 0x20) = T(F3, 0x08);
+    }
+    if (r_edx && r_esp10) {
+        /* 0x1c4026e4: Spanish stop loci by vowel code. */
+        static const struct { uint8_t code; int16_t f2, f3; } loci[] = {
+            {0x09, 0x8de, 0xc1c}, {0x0d, 0x834, 0xa14}, {0x11, 0x76c, 0x97e},
+            {0x1f, 0x866, 0xa41}, {0x21, 0x7e4, 0x92e}, {0x23, 0x4b0, 0x960},
+            {0x27, 0x3e8, 0x9f6}, {0x29, 0x5dc, 0x76c}, {0x36, 0x78a, 0x9a6},
+            {0x37, 0x410, 0x8ca}, {0x38, 0x5dc, 0x76c}, {0x5c, 0x3e8, 0x9f6},
+            {0x6c, 0x78a, 0x9a6},
+        };
+        for (size_t k = 0; k < sizeof loci / sizeof loci[0]; k++)
+            if (loci[k].code == CODE3) {
+                T(F2, 0x24) = loci[k].f2;
+                T(F3, 0x24) = loci[k].f3;
+                break;
+            }
+    }
+
+    /* 0x1c4027ec: rate columns. */
+    FB6(T(trk, 0x2c) = 0xa; T(trk, 0x30) = 0xc);
+    if (ATTR2 & 0x1000000u)
+        FB6(T(trk, 0x30) = 5);
+    if (r_ecx && (ATTR3 & 0x1000000u)) {
+        T(B1, 0x30) = 6; T(F1, 0x30) = 6;
+        T(B2, 0x30) = 8; T(F2, 0x30) = 8; T(B3, 0x30) = 8; T(F3, 0x30) = 8;
+    }
+    if (CODE2 == 0x39) {
+        int32_t v = (ATTR3 & 0x1000000u) ? 3 : 5;
+        T(B2, 0x30) = v; T(F2, 0x30) = v; T(B3, 0x30) = v; T(F3, 0x30) = v;
+    }
+    if (IS_GLIDE(CODE2)) {
+        T(F1, 0x30) = 4; T(F1, 0x2c) = 4; T(F2, 0x30) = 4; T(F2, 0x2c) = 4;
+        T(F3, 0x30) = 5; T(F3, 0x2c) = 5;
+        T(B1, 0x30) = 2; T(B1, 0x2c) = 2; T(B2, 0x30) = 2; T(B2, 0x2c) = 2;
+        T(B3, 0x30) = 2; T(B3, 0x2c) = 2;
+    }
+    r_eax = ATTR1 & 0x2000;
+    if (r_eax && CODE1 != 0x36) {
+        if (!r_edi)
+            goto after_glide;
+        FB6(T(trk, 0x2c) = 7);
+    }
+    if (r_edi && F10_2 && F10_0 && r_eax && (ATTR0 & 0x40000u))
+        FB6(T(trk, 0x2c) = 5);
+after_glide:
+    if (CLS1 == 3) {
+        if (r_ecx) {
+            /* 0x1c4029b8: F3 +0x2c is written at the shared tail below. */
+            T(B1, 0x2c) = 5; T(F1, 0x2c) = 5;
+            T(B2, 0x2c) = 7; T(F2, 0x2c) = 7; T(B3, 0x2c) = 7; T(F3, 0x2c) = 7;
+            goto after_class;
+        }
+    } else if (r_ecx && CLS3 == 3) {
+        T(B1, 0x30) = 5; T(F1, 0x30) = 5;
+        T(B2, 0x30) = 7; T(F2, 0x30) = 7; T(B3, 0x30) = 7; T(F3, 0x30) = 7;
+        goto after_class;
+    }
+    if (CLS2 == 3) {
+        T(B2, 0x30) = 3; T(B1, 0x30) = 2; T(B1, 0x2c) = 2; T(F1, 0x30) = 2;
+        T(F1, 0x2c) = 2; T(B2, 0x2c) = 3; T(F2, 0x30) = 3; T(F2, 0x2c) = 3;
+        T(B3, 0x30) = 3; T(B3, 0x2c) = 3; T(F3, 0x30) = 3; T(F3, 0x2c) = 3;
+    }
+after_class:
+    if (CODE2 == 0x37)
+        FB6(T(trk, 0x30) = 3);
+    if (r_edi && (ATTR3 & 0x800))
+        FB6(T(trk, 0x30) = 5);
+    if (r_esi) {
+        if (ATTR1 & 0x1000040u) {
+            T(B3, 0x2c) = 5; T(B2, 0x2c) = 5; T(B1, 0x2c) = 5;
+        }
+        if (ATTR3 & 0x1000040u) {
+            T(B3, 0x30) = 5; T(B2, 0x30) = 5; T(B1, 0x30) = 5;
+        }
+    }
+    GLIDE = IS_GLIDE(CODE2);
+    if (IS_GLIDE(CODE3)) {
+        T(B2, 0x24) = 0xfa;
+        T(B2, 0x30) = 2;
+    }
+    if (IS_GLIDE(CODE1)) {
+        T(B2, 0x20) = 0xfa;
+        T(B2, 0x2c) = 2;
+    }
+}
+
 /* ------------------------------------------------------------------------ */
 /* 0x1c2030b0 — voicing (AV), aspiration (AH), DI and TL targets             */
 /*                                                                           */
@@ -856,12 +1230,100 @@ static void voicing_targets(sv_engine *e)
     T(TL, 0x24) = T(TL, 0x0c) + (s - T(TL, 0x0c)) * 50 / 100;
 }
 
+/* TISPAN32 0x1c402d00: Spanish voicing targets. The table layout, AV/AH
+ * interpolation and DI/TL tail are English's; the vowel-glide codes 0x36 and
+ * 0x6c replace English's 0x3f special case, the aspiration switch has its
+ * own codes, and there is no post-release aspiration block. */
+static void voicing_targets_span(sv_engine *e)
+{
+    track_shift(e, AV);
+    track_shift(e, AH);
+    uint32_t c23 = ((uint32_t)CLS2 * 10 + CLS3) * 10;
+    uint32_t c12 = ((uint32_t)CLS1 * 10 + CLS2) * 10;
+    T(AV, 0x28) = B(0x1c24c460 + c23);
+    T(AV, 0x38) = 0;
+    T(AV, 0x3c) = 0x4b;
+    T(AV, 0x2c) = B(0x1c24c463 + c12);
+    T(AV, 0x30) = B(0x1c24c466 + c23);
+    T(AH, 0x28) = B(0x1c24c461 + c23);
+    T(AH, 0x2c) = B(0x1c24c464 + c12);
+    T(AH, 0x30) = B(0x1c24c467 + c23);
+    if (CODE2 == 0x36 || CODE2 == 0x6c) {
+        T(AV, 0x30) = 1;
+        T(AV, 0x2c) = 1;
+    }
+    if (ATTR2 & 0x800000u) {
+        if (CODE3 == 0x36 || CODE3 == 0x6c)
+            T(AV, 0x28) = 0;
+        if (CODE1 == 0x36 || CODE1 == 0x6c)
+            T(AV, 0x20) = T(AV, 0x08);
+    }
+
+    unsigned c3 = CODE3;
+    T(AV, 0x18) = e->window[3]->phonemes[c3 * SV_PH_STRIDE + 0x16];
+    if ((ATTR3 & 0x20000000u) && !(ATTR2 & 0x8000000u))
+        T(AV, 0x18) = 0;
+    if ((ATTR2 & 0x10000000u) && (ATTR3 & 0x8000000u) && (ATTR3 & 0x40) &&
+        (ATTR4 & 0x10000000u))
+        T(AV, 0x18) += 6;
+    T(AV, 0x1c) = T(AV, 0x18);
+    if ((ATTR3 & 0x8000000u) && !(ATTR4 & 0x8000000u))
+        T(AV, 0x1c) = T(AV, 0x18) - 3;
+    T(AH, 0x18) = 0;
+    T(AV, 0x18) = TB(0x1c2065be + (uint32_t)T(AV, 0x18));
+    T(AV, 0x1c) = TB(0x1c2065be + (uint32_t)T(AV, 0x1c));
+    if (ATTR3 & 0x44) {
+        switch (c3) {
+        case 0x41: case 0x42: T(AH, 0x18) = 0x20; break;
+        case 0x43: T(AH, 0x18) = 0x24; break;
+        case 0x44: T(AH, 0x18) = 0x21; break;
+        case 0x4b: T(AH, 0x18) = 0x28; break;
+        default: break;
+        }
+    }
+    T(AH, 0x18) = TB(0x1c2065c8 + (uint32_t)T(AH, 0x18));
+    T(AH, 0x1c) = T(AH, 0x18);
+
+    T(AV, 0x24) = T(AV, 0x0c) + (T(AV, 0x18) - T(AV, 0x0c)) * T(AV, 0x28) / 100;
+    T(AH, 0x24) = T(AH, 0x0c) + (T(AH, 0x18) - T(AH, 0x0c)) * T(AH, 0x28) / 100;
+    if (T(AV, 0x18) <= 0)
+        T(AV, 0x18) = 0;
+    if (T(AV, 0x1c) <= 0)
+        T(AV, 0x1c) = 0;
+    if (T(AV, 0x24) <= 0)
+        T(AV, 0x24) = 0;
+
+    track_shift(e, DI);
+    track_shift(e, TL);
+    T(TL, 0x18) = (ATTR3 & 0x8000000u) ? 0xc : 8;
+    if (F10_3)
+        T(TL, 0x18) += 2;
+    if ((FLAGS3 & 4) && !F10_3)
+        T(TL, 0x18) -= 2;
+    if (ATTR3 & 0x1000000u)
+        T(TL, 0x18) -= 5;
+    if (CODE3 == 1)
+        T(B1, 0x0c) += 0x32;
+    int32_t s = T(TL, 0x18) << 8;
+    T(TL, 0x30) = 3;
+    T(TL, 0x2c) = 3;
+    T(TL, 0x18) = s;
+    T(TL, 0x1c) = s;
+    T(DI, 0x24) = T(DI, 0x0c) + (T(DI, 0x18) - T(DI, 0x0c)) * T(DI, 0x28) / 100;
+    T(TL, 0x28) = 0x32;
+    T(TL, 0x24) = T(TL, 0x0c) + (s - T(TL, 0x0c)) * 50 / 100;
+}
+
 /* ------------------------------------------------------------------------ */
 /* 0x1c249310 — frication: AF, AK, K1, Q1, and the burst                    */
 /* ------------------------------------------------------------------------ */
 static void frication_targets(sv_engine *e, const sv_record *cur)
 {
     const uint8_t *ph = cur->phonemes;
+    /* TISPAN32 0x1c40a9e0 is this function with the differences marked
+     * `span`: 0x6c joins 0x36 as the glide, 0x3f and 0x15 lose their special
+     * cases, and several constants and burst levels change. */
+    const int span = e->lang->id == SV_LANG_SPANISH;
     track_shift(e, K1);
     track_shift(e, Q1);
     track_shift(e, AF);
@@ -873,11 +1335,13 @@ static void frication_targets(sv_engine *e, const sv_record *cur)
         static const int32_t af[8] = {0x30, 0x3d, 0x37, 0x31, 0x2e, 0x3c, 0x38, 0x35};
         unsigned k = (unsigned)CODE3 - 0x41;
         T(AF, 0x18) = k <= 7 ? af[k] : 0;
+        if (span && k == 0)
+            T(AF, 0x18) = 0x2f;
         if ((ATTR2 & 0x10000) && !(ATTR3 & 0x80))
             T(AF, 0x18) += 3;
         if (F10_3 == 0) {
             T(AF, 0x18) -= 2;
-            if (FLAGS3 & 4)
+            if (span ? (ATTR3 & 2) : (FLAGS3 & 4))
                 T(AF, 0x18) -= 2;
         }
         T(AF, 0x1c) = T(AF, 0x18);
@@ -892,12 +1356,18 @@ static void frication_targets(sv_engine *e, const sv_record *cur)
     T(AF, 0x1c) = TB(0x1c2065be + (uint32_t)T(AF, 0x1c));
 
     uint32_t r_ebx = ATTR3 & 0x40040u;
-    if (r_ebx || CODE3 == 0x3f) {
-        int r_esi = (CODE4 == 0x29 || CODE4 == 0x38 || CODE4 == 0x15);
+    if (r_ebx || (!span && CODE3 == 0x3f)) {
+        int r_esi = (CODE4 == 0x29 || CODE4 == 0x38 || (!span && CODE4 == 0x15));
         uint32_t r_edx = ATTR3 & 2;
         int16_t bp, ax, di;
         if (r_edx) {
-            if ((ATTR3 & 0x40000u) && CODE4 == 0x36) {
+            if (span) {
+                if ((ATTR3 & 0x40000u) && (CODE4 == 0x36 || CODE4 == 0x6c)) {
+                    bp = 0xdac; ax = 0x1c2; di = -18;
+                } else {
+                    bp = 0xfa0; ax = 0x1f4; di = -18;
+                }
+            } else if ((ATTR3 & 0x40000u) && CODE4 == 0x36) {
                 bp = 0xa28; ax = 0x190; di = -18;
             } else {
                 bp = 0x1194; ax = 0x1f4; di = -18;
@@ -924,7 +1394,7 @@ static void frication_targets(sv_engine *e, const sv_record *cur)
              * into this function it holds 2030b0's saved EBX, which is the
              * generator's loop constant 0x4b (0x1c204be1), so the original
              * deterministically uses 0x4b for all three. */
-            bp = ax = di = 0x4b;
+            bp = ax = di = span ? 0x19 : 0x4b;   /* TISPAN32's EBX there is 0x19 */
         }
         T(K1, 0x1c) = bp; T(K1, 0x18) = bp;
         T(Q1, 0x1c) = ax; T(Q1, 0x18) = ax;
@@ -933,7 +1403,7 @@ static void frication_targets(sv_engine *e, const sv_record *cur)
             if (r_esi)
                 T(K1, 0x1c) -= 0x12c;
             if (ATTR2 & 0x200000u)
-                T(K1, 0x18) -= 0x96;
+                T(K1, 0x18) -= span ? 0x12c : 0x96;
         }
         if (ATTR3 & 0x10000) {
             if (ATTR2 & 0x10002000u) {
@@ -998,7 +1468,7 @@ static void frication_targets(sv_engine *e, const sv_record *cur)
     W(0x1c25058c) = 0;
     W(0x1c25055c) = 0;
     uint32_t r_edx = ATTR2 & 1;
-    if (!(r_edx || CODE2 == 0x3f)) {
+    if (!(r_edx || (!span && CODE2 == 0x3f))) {
         if (!r_ecx2)
             return;
         if ((ATTR3 & 0x20000000u) && !(ATTR3 & 0x8000))
@@ -1011,9 +1481,9 @@ static void frication_targets(sv_engine *e, const sv_record *cur)
             break;
     }
     W(0x1c25058c) = B(0x1c24c401 + 2 * k);
-    if (CODE1 != 0x41 && CODE2 == 0x52 && CODE3 == 0x36)
+    if (CODE1 != 0x41 && CODE2 == 0x52 && (CODE3 == 0x36 || (span && CODE3 == 0x6c)))
         W(0x1c25058c) += 3;
-    if (r_edx && F10_2 && CODE3 != 0x36)
+    if (r_edx && F10_2 && CODE3 != (span ? 0x6c : 0x36))
         W(0x1c25058c) += 2;
     if (CODE1 == 0x41 && (FLAGS1 & 0x80))
         W(0x1c25058c) = 2;
@@ -1023,7 +1493,19 @@ static void frication_targets(sv_engine *e, const sv_record *cur)
             ax = (int16_t)NFR2;
         W(0x1c25058c) = ax;
     }
-    if (r_ecx2 || CODE2 == 0x3f) {
+    if (span && r_ecx2) {
+        /* TISPAN32 0x1c40b0a2 */
+        int16_t lvl = 0;
+        switch (CODE2) {
+        case 0x49: lvl = 0x3b; break;
+        case 0x4a: lvl = 0x3e; break;
+        case 0x51: lvl = 0x32; break;
+        case 0x52: lvl = (CODE1 != 0x41 && CODE3 == 0x6c) ? 0x2b : 0x25; break;
+        case 0x54: lvl = 0x3a; break;
+        default: break;
+        }
+        W(0x1c25055c) = lvl;
+    } else if (!span && (r_ecx2 || CODE2 == 0x3f)) {
         int16_t lvl = 0;
         switch (CODE2) {
         case 0x3f: lvl = 0x2a; break;
@@ -1051,11 +1533,11 @@ static void frication_targets(sv_engine *e, const sv_record *cur)
         W(0x1c25055c) -= 3;
     if (r_ebx)
         W(0x1c25055c) -= 3;
-    else if (CODE3 == 0x1c)
+    else if (!span && CODE3 == 0x1c)
         W(0x1c25055c) -= 5;
     if (CODE1 == 0x41 && (FLAGS1 & 0x80))
         W(0x1c25055c) -= 3;
-    if (r_esi2 && CODE3 == 0x36)
+    if (!span && r_esi2 && CODE3 == 0x36)
         W(0x1c25055c) += 6;
     if (r_edx)
         return;
@@ -1405,15 +1887,22 @@ int sv_lang_generate(sv_engine *e)
         T(t, 0x34) = 3;
     }
     W(0x1c250e88) = W(0x1c25058c);
-    formant_targets(e, cur);
-    voicing_targets(e);
+    if (e->lang->id == SV_LANG_SPANISH) {
+        formant_targets_span(e, cur);
+        voicing_targets_span(e);
+    } else {
+        formant_targets(e, cur);
+        voicing_targets(e);
+    }
     frication_targets(e, cur);
 
     /* 0x1c204c45: rate rows from the voice. */
     {
-        int32_t v = (int16_t)(e->st_5e + 3);
+        int32_t v = e->lang->id == SV_LANG_SPANISH ? 5 : (int16_t)(e->st_5e + 3);
+        /* TISPAN32 0x1c4045dc fixes the six formant/bandwidth rows at 5. */
         T(F3, 0x34) = v; T(F2, 0x34) = v; T(F1, 0x34) = v; T(B3, 0x34) = v;
-        T(B2, 0x34) = v; T(B1, 0x34) = v; T(Q1, 0x34) = v; T(K1, 0x34) = v;
+        T(B2, 0x34) = v; T(B1, 0x34) = v;
+        v = (int16_t)(e->st_5e + 3); T(Q1, 0x34) = v; T(K1, 0x34) = v;
         T(AV, 0x34) = (int16_t)e->st_7e + 3;
         T(AH, 0x34) = (int16_t)e->st_80 + 3;
         v = (int16_t)e->st_82 + 3;
@@ -1439,7 +1928,9 @@ int sv_lang_generate(sv_engine *e)
     }
     burst(e);
 
-    if ((ATTR2 & 0x40000u) && (ATTR2 & 0x8000000u)) {
+    if ((ATTR2 & 0x40000u) && (ATTR2 & 0x8000000u) &&
+        (e->lang->id != SV_LANG_SPANISH || (F10_2 &&
+            ((ATTR1 & 0x20000000u) || (FLAGS1 & 8) || CODE2 == 0x4f)))) {
         /* 0x1c204d5c: voiced stop closure — voice bar. */
         int16_t d = ((ATTR1 & 0x8000000u) && (ATTR1 & 0x800000u) && e->st_2f2 != 2) ? 5 : 0x3c;
         g->s1c = (g->s1c & 0xffff0000u) | (uint16_t)d;
@@ -1457,6 +1948,7 @@ int sv_lang_generate(sv_engine *e)
         }
     }
     int nasal = (ATTR2 & 0x8000u) != 0;
+    const int span = e->lang->id == SV_LANG_SPANISH;
     uint32_t s34 = nasal ? 0x10 : 0;
 
     static const uint32_t cur17[17] = {
@@ -1586,6 +2078,32 @@ int sv_lang_generate(sv_engine *e)
         if (ATTR2 & 0x8000)
             CV(CUR_AH) = (int16_t)(CV(CUR_AH) - 7);
 
+        if (span && GLIDE) {
+            /* TISPAN32 0x1c404e74: a glide alternates its formants frame by
+             * frame, strongest on every fourth-plus-one frame. */
+            switch (fi & 3) {
+            case 0:
+            case 2:
+                f1v -= 0x32;
+                f2v = (f2v * 3 + 0x4b0) >> 2;
+                g->s28 = (g->s28 + 0xc8) >> 1;
+                b1v += 0x28;
+                CV(CUR_AV) = (int16_t)(CV(CUR_AV) - 3);
+                f3v = (f3v + 0x7d0) >> 1;
+                break;
+            case 1:
+                f1v -= 0x64;
+                f2v = (f2v + 0x4b0) >> 1;
+                b1v += 0x50;
+                CV(CUR_AV) = (int16_t)(CV(CUR_AV) - 6);
+                g->s28 = 0xc8;
+                f3v = 0x7d0;
+                break;
+            default:
+                break;
+            }
+        }
+
         /* 0x1c2054b0: formant scaling by voice type (st_52: 1 child-like,
          * 2 and 3 other vocal tracts), with st_5c as the depth. */
         int32_t ebp = (int16_t)e->st_5c + 10;
@@ -1594,6 +2112,22 @@ int sv_lang_generate(sv_engine *e)
             CV(CUR_AV) = (int16_t)(CV(CUR_AV) - 0xa);
             CV(CUR_AH) = (int16_t)(CV(CUR_AH) - 0x14);
             CV(CUR_AF) = (int16_t)(CV(CUR_AF) - 6);
+            if (span) {
+                /* TISPAN32 0x1c404f15: Spanish also rescales the formants. */
+                f3v += 0x1d1;
+                int32_t n1 = (f1v - 0x1c2) * ebp * 115 / 1000 + 0x24a;
+                int32_t n2 = (f2v - 0x5aa) * ebp * 135 / 1000 + 0x6de;
+                if (f3v - n2 < 0x12c)
+                    f3v = n2 + 0x12c;
+                b1v = n1 * b1v / f1v + 0x32;
+                g->s28 = n2 * g->s28 / f2v;
+                if (b1v >= 0x15e)
+                    b1v = 0x15e;
+                if (b1v <= 0x46)
+                    b1v = 0x46;
+                f1v = n1;
+                f2v = n2;
+            }
             CV(CUR_K1) = (int16_t)(CV(CUR_K1) + 0x96);
         } else if (e->st_52 == 2) {
             s14 = (int16_t)(s14 - 1);

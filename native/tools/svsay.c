@@ -33,12 +33,18 @@ static void put16(FILE *f, uint16_t v)
 int main(int argc, char **argv)
 {
     int text = 0, i = 1;
-    if (argc > 1 && strcmp(argv[1], "-t") == 0) {
-        text = 1;
-        i++;
+    uint32_t language = TISPEECH_LANG_ENGLISH;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1] && !argv[i][2]; i++) {
+        if (argv[i][1] == 't')
+            text = 1;
+        else if (argv[i][1] == 's')
+            language = TISPEECH_LANG_SPANISH;
+        else
+            break;
     }
     if (argc - i != 2) {
-        fprintf(stderr, "usage: svsay [-t] \"PHONEMES OR TEXT\" out.wav\n");
+        fprintf(stderr, "usage: svsay [-t] [-s] \"PHONEMES OR TEXT\" out.wav\n"
+                        "  -t  convert text first; -s  Spanish (UTF-8 text)\n");
         return 2;
     }
     if (!(tispeech_capabilities() & TISPEECH_CAP_SYNTHESIS)) {
@@ -48,7 +54,7 @@ int main(int argc, char **argv)
     const char *phon = argv[i];
     char buf[8192];
     if (text) {
-        int32_t rc = tispeech_text_to_phonemes(TISPEECH_LANG_ENGLISH, argv[i], buf, sizeof buf);
+        int32_t rc = tispeech_text_to_phonemes(language, argv[i], buf, sizeof buf);
         if (rc != TISPEECH_OK) {
             fprintf(stderr, "svsay: text_to_phonemes failed (%#x)\n", (unsigned)rc);
             return 1;
@@ -58,7 +64,7 @@ int main(int argc, char **argv)
     }
     uint8_t *pcm;
     int32_t n, rate;
-    int32_t rc = tispeech_synthesize(TISPEECH_LANG_ENGLISH, phon, &pcm, &n, &rate);
+    int32_t rc = tispeech_synthesize(language, phon, &pcm, &n, &rate);
     if (rc != TISPEECH_OK) {
         fprintf(stderr, "svsay: synthesize failed (%#x)\n", (unsigned)rc);
         return 1;

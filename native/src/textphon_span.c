@@ -495,30 +495,24 @@ static int default_stress(fe_t *fe)
         unsigned char *at = NULL, *prev = NULL;
         int matches = 0;
         unsigned char *p = end;
-        for (;;) {
-            const unsigned char *t = table;
-            int found = 0;
-            for (; t < table + 16; t += 2) {
-                if (t[0] == *p && t[-1] == p[-1]) {
-                    found = 1;
-                    if (t == table && matches == 1 && prev && (prev - p) != 2)
-                        found = 0;   /* not one diphthong: keep scanning */
-                    if (found)
-                        break;
-                }
-            }
-            if (found) {
+        while (*p != ' ') {
+            for (const unsigned char *t = table; t < table + 16; t += 2) {
+                if (t[0] != *p || t[-1] != p[-1])
+                    continue;
                 at = p;
                 matches++;
-                if (matches >= 2)
-                    break;
+                /* 0x1c407335..0x1c40735d: the first vowel pair may
+                 * extend a diphthong. After a match the original advances
+                 * both cursors, then decrements p again after the table. */
+                if (matches >= 2 &&
+                    (t != table || matches != 2 || prev - p != 2)) {
+                    end = p;
+                    goto insert_stress;
+                }
                 prev = p;
                 p--;
-                continue;
             }
             p--;
-            if (*p == ' ')
-                break;
         }
         if (matches == 0)
             return 0;
@@ -526,27 +520,25 @@ static int default_stress(fe_t *fe)
     } else {
         unsigned char *p = end;
         for (;;) {
-            const unsigned char *t = table;
-            int found = 0;
-            for (; t < table + 16; t += 2)
-                if (t[0] == *p && t[-1] == p[-1]) { found = 1; break; }
-            if (found) {
-                end = p;
-                break;
+            for (const unsigned char *t = table; t < table + 16; t += 2) {
+                if (t[0] == *p && t[-1] == p[-1]) {
+                    end = p;
+                    goto insert_stress;
+                }
             }
-            if (*p == ' ')
+            if (*--p == ' ')
                 return 0;
-            p--;
         }
     }
 
+insert_stress:
     if (fe->cls[end[1]] & 2)   /* already has a stress mark right after it */
         return 0;
     if (c->out_left < 1)
         return 1;
     c->out_left--;
     {
-        unsigned char *d = end;
+        unsigned char *d = end + 1;
         unsigned char carry = '5';
         while (*d) {
             unsigned char t = *d;
@@ -579,7 +571,7 @@ static int spell(fe_t *fe)
         if (ch == 0 || ch >= 0x80)
             break;
         nx = (unsigned char)*p;
-        s = ST(0x1c40ef58u + 8u * (uint32_t)ch);
+        s = ST(rd32(fe, 0x1c40ef58u + 8u * (uint32_t)ch));
         if (ch == '.') {
             if (ct(nx) & 4)
                 s = ST(0x1c40f360u);
@@ -668,7 +660,7 @@ static int lang_word(fe_t *fe)
         if (c->status & 4)
             continue;
         if (stress_all || (c->status & 1))
-            default_stress(fe);
+            return default_stress(fe);
         return 0;
     }
 }

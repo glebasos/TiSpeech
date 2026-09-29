@@ -11,6 +11,12 @@
     } \
 } while (0)
 
+#ifdef TISPEECH_HAVE_FRONTEND_SPAN
+#  define HAVE_FRONTEND_SPAN 1
+#else
+#  define HAVE_FRONTEND_SPAN 0
+#endif
+
 #if defined(TISPEECH_HAVE_ENG) || defined(TISPEECH_HAVE_SPAN)
 static int check_language(uint32_t language, const sv_ruleset_t *rules)
 {
@@ -36,20 +42,20 @@ static int check_language(uint32_t language, const sv_ruleset_t *rules)
     /* The ABI accepts UTF-8; the rule engine must receive a single Latin-1
      * byte for each accented letter, not the original UTF-8 byte pair. */
     CHECK(sv_rules_apply(rules, accented + 1, expected, sizeof(expected), 0) == 0);
+    /* Expected strings are the original SVTextToPhon's (TIENG32 / TISPAN32
+     * under tools/sv_emu.py); the matcher-only path agrees with the matcher. */
+    const char *cafe = language == TISPEECH_LANG_ENGLISH ? " KAEFEY4"
+                     : HAVE_FRONTEND_SPAN ? " KAAFEH5" : expected;
     CHECK(tispeech_text_to_phonemes(language, "caf\xc3\xa9", output, sizeof(output)) == TISPEECH_OK);
-    if (language == TISPEECH_LANG_ENGLISH)
-        CHECK(strcmp(output, " KAEFEY4") == 0); /* Original SVTextToPhon. */
-    else
-        CHECK(strcmp(output, expected) == 0);
+    CHECK(strcmp(output, cafe) == 0);
     CHECK(tispeech_text_to_phonemes(language, "CAF\xc3\x89", output, sizeof(output)) == TISPEECH_OK);
-    if (language == TISPEECH_LANG_ENGLISH)
-        CHECK(strcmp(output, " KAEFEY4") == 0); /* Original SVTextToPhon. */
-    else
-        CHECK(strcmp(output, expected) == 0);
+    CHECK(strcmp(output, cafe) == 0);
     CHECK(tispeech_text_to_phonemes(language, "hello world", expected, sizeof(expected)) == TISPEECH_OK);
     CHECK(tispeech_text_to_phonemes(language, "\thello\xc2\xa0world\n", output, sizeof(output)) == TISPEECH_OK);
     if (language == TISPEECH_LANG_ENGLISH)
         CHECK(strcmp(output, "  /HEH5LOW WER5LD") == 0); /* Original keeps tab spacing. */
+    else if (HAVE_FRONTEND_SPAN)
+        CHECK(strcmp(output, "  EY5OH WOH5RLD") == 0);
     else
         CHECK(strcmp(output, expected) == 0);
     return 0;
@@ -99,11 +105,22 @@ int main(void)
         CHECK(tispeech_synthesize_ex(1, " /HEH5LOW", &opts, &samples, &count, &rate) == TISPEECH_E_BADPARAM);
         CHECK(samples == NULL && count == 0 && rate == 0);
     }
+#  ifdef TISPEECH_HAVE_SYNTH_SPAN
+    CHECK(tispeech_synthesis_languages() == (TISPEECH_LANG_ENGLISH | TISPEECH_LANG_SPANISH));
+    CHECK(tispeech_synthesize(TISPEECH_LANG_SPANISH, " OH5LAA MUW5NDOH", &samples, &count, &rate) == TISPEECH_OK);
+    CHECK(samples != NULL && count > 0x2000 && rate == 11025);
+    tispeech_free_samples(samples);
+#  else
+    CHECK(tispeech_synthesis_languages() == TISPEECH_LANG_ENGLISH);
     CHECK(tispeech_synthesize(TISPEECH_LANG_SPANISH, " OHLAA", &samples, &count, &rate) == TISPEECH_E_NOLANGUAGE);
+#  endif
+    CHECK(tispeech_synthesize(TISPEECH_LANG_ENGLISH | TISPEECH_LANG_SPANISH, " OHLAA", &samples, &count, &rate)
+          == TISPEECH_E_NOLANGUAGE);
     CHECK(tispeech_synthesize(TISPEECH_LANG_ENGLISH, " XYZ", &samples, &count, &rate) == TISPEECH_E_BADPARAM);
     CHECK(samples == NULL && count == 0 && rate == 0);
     CHECK(tispeech_synthesize(TISPEECH_LANG_ENGLISH, " \xc3\xa9", &samples, &count, &rate) == TISPEECH_E_BADPARAM);
 #else
+    CHECK(tispeech_synthesis_languages() == 0);
     CHECK(tispeech_synthesize(1, "HELLO", &samples, &count, &rate) == TISPEECH_E_NOTIMPL);
     CHECK(samples == NULL && count == 0 && rate == 0);
 #endif
@@ -155,7 +172,8 @@ int main(void)
         CHECK(tispeech_text_to_phonemes(1, "hello world", plain, sizeof plain) == TISPEECH_OK);
         CHECK(strcmp(output, plain) == 0);
         CHECK(tispeech_text_to_phonemes_ex(TISPEECH_LANG_SPANISH, "hola", dict, output, sizeof output)
-              == (languages & TISPEECH_LANG_SPANISH ? TISPEECH_E_NOTIMPL : TISPEECH_E_NOLANGUAGE));
+              == (HAVE_FRONTEND_SPAN ? TISPEECH_OK : languages & TISPEECH_LANG_SPANISH
+                  ? TISPEECH_E_NOTIMPL : TISPEECH_E_NOLANGUAGE));
         tispeech_userdict_free(dict);
 
         CHECK(tispeech_userdict_load(file, 100, &dict) == TISPEECH_E_DICTSHORT && dict == NULL);
@@ -174,11 +192,19 @@ int main(void)
     CHECK((languages & TISPEECH_LANG_SPANISH) != 0);
     CHECK(strstr(tispeech_build_info(), "Spanish") != NULL);
     CHECK(check_language(TISPEECH_LANG_SPANISH, &sv_lang_data_span) == 0);
+#  if HAVE_FRONTEND_SPAN
+    /* The original SVTextToPhon, including default stress. */
+    CHECK(tispeech_text_to_phonemes(TISPEECH_LANG_SPANISH, "hola mundo", output, sizeof(output)) == TISPEECH_OK);
+    CHECK(strcmp(output, " OH5LAA MUW5NDOH") == 0);
+    /* Spanish cardinal numbers are not reconstructed. */
+    CHECK(tispeech_text_to_phonemes(TISPEECH_LANG_SPANISH, "hola 42", output, sizeof(output)) == TISPEECH_E_NOTIMPL);
+#  else
     /* Confirmed by TISPAN32!0x1c4062f0 oracle probes, not another C path. */
     CHECK(tispeech_text_to_phonemes(TISPEECH_LANG_SPANISH, "hola mundo", output, sizeof(output)) == TISPEECH_OK);
     CHECK(strcmp(output, "OHLAA MUWNDOH") == 0);
     CHECK(tispeech_text_to_phonemes(TISPEECH_LANG_SPANISH, "caf\xc3\xa9", output, sizeof(output)) == TISPEECH_OK);
     CHECK(strcmp(output, "KAAFEH5") == 0);
+#  endif
 #else
     CHECK((languages & TISPEECH_LANG_SPANISH) == 0);
     CHECK(tispeech_text_to_phonemes(TISPEECH_LANG_SPANISH, "hola", output, sizeof(output)) == TISPEECH_E_NOLANGUAGE);

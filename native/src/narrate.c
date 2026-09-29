@@ -775,6 +775,9 @@ static void apply_switches(sv_engine *e)
                         ph = lang->phonemes_b;
                     else
                         ph = lang->phonemes_a;
+                    /* 0x1c003eef: stored back into the engine, so the next
+                     * sentence's parse starts with this table. */
+                    e->phonemes = ph;
                 }
                 c += 3;
             } while (c[0] != SV_CMD_END);

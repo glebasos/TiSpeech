@@ -6,10 +6,10 @@ and the Spanish text front end's (src/textphon_span.c) own tables.
 
 WHY THIS EXISTS, AND HOW IT WORKS
 ----------------------------------
-src/langgen.c is TIENG32's frame generator (module vtable +0x08), reused
-VERBATIM for TISPAN32 because the two are the same compiled code at
-different addresses (REVERSING.md, "the language modules are one code
-base": 120/120 identical instruction forms). It addresses ~200 module
+src/langgen.c is TIENG32's frame generator (module vtable +0x08), also used
+for TISPAN32: the two share their structure, globals layout and every leaf
+function, and the handful of Spanish-only rules are branches inside
+langgen.c itself (REVERSING.md, "Spanish synthesis"). It addresses ~200 module
 globals -- 17 parameter tracks, contour buffers, a five-record window, and
 a handful of constant tables -- through TIENG32's OWN literal virtual
 addresses via langmod_priv.h's DP()/B()/W()/L() macros, which resolve
@@ -91,21 +91,20 @@ from extract_generator import Image, find_rate_table  # noqa: E402
 BUF_DVA = 0x1c24b000          # == TIENG32 .data VA; langgen.c's coordinate space
 BUF_HI = 0x1c412000           # covers every address this port's Spanish files use
 
-# langgen.c's TB() range: four 0x100-byte per-stress lookups at 0x1c205ff4,
-# 0x1c2060f4, 0x1c2061f4, 0x1c2062f4 (IDX() produces a uint8_t index, so each
-# table is exactly 0x100 bytes; the four are contiguous). The wider range
-# 0x1c205fb9:0x1c206780 documented for extract_images.py's English --text-range
-# includes unrelated bytes that are NOT byte-identical between the two DLLs
-# (never read by langgen.c) -- narrowed here to exactly what is read, which
-# IS confirmed byte-identical.
-TEXT_LO_ENG, TEXT_HI_ENG = 0x1c205ff4, 0x1c2063f4
+# langgen.c's TB() range: four 0x100-byte frame-quantisation lookups at
+# 0x1c205ff4..0x1c2063f3, then the dB and level tables at 0x1c2065be,
+# 0x1c2065c8 and 0x1c20660e. The wider 0x1c205fb9 start documented for
+# extract_images.py's English --text-range includes jump tables that are NOT
+# byte-identical between the two DLLs (never read through TB()); from
+# 0x1c205ff4 on the range IS confirmed byte-identical.
+TEXT_LO_ENG, TEXT_HI_ENG = 0x1c205ff4, 0x1c206780
 
 # (TIENG32 VA, size) -- overlaid with TISPAN32's own bytes at the rate-table delta.
 OVERLAY_TABLES = [
     (0x1c24c3f0, 16),   # transition-percentage table (0x1c24c400 code-lookup table
                         # right after it is byte-identical, so NOT overlaid)
     (0x1c24c420, 64),   # nasalised-vowel target table
-    (0x1c24c460, 96),   # manner-class pair table
+    (0x1c24c460, 1000), # manner-class pair table, 10x10 entries of 10 bytes
 ]
 
 # Byte-identical sanity checks (language-independent "universal constants"

@@ -4,20 +4,22 @@ A .NET 10 library for the SoftVoice speech engine originally shipped with Micros
 
 ## Portable reconstruction
 
-`native/` reconstructs the English text front end and the full phoneme-to-PCM
-pipeline. `TiSpeechNative.TextToPhonemes` includes exception pronunciations,
-number expansion and default stress for English; Spanish currently has only
-letter-to-sound conversion. English input is limited to 514 Latin-1 characters
-per call. Longer passages return an explicit error.
+`native/` reconstructs the English and Spanish text front ends and the full
+phoneme-to-PCM pipeline. `TiSpeechNative.TextToPhonemes` includes exception
+pronunciations, number expansion and default stress; Spanish numbers are not
+reconstructed yet and return an explicit error (spell them out). Input is
+limited to 514 Latin-1 characters per call. Longer passages return an explicit
+error. The Spanish front end needs `TIENG32.DLL` as well as `TISPAN32.DLL` at
+build time; with `TISPAN32.DLL` alone it falls back to letter-to-sound rules.
 
-With both `TIENG32.DLL` and `TIBASE32.DLL` supplied at build time,
-`TiSpeechNative.Synthesize` returns original-voice 8-bit mono PCM at 11025 Hz.
+With `TIBASE32.DLL` and `TIENG32.DLL` supplied at build time,
+`TiSpeechNative.Synthesize` returns original-voice 8-bit mono PCM at 11025 Hz;
+adding `TISPAN32.DLL` enables Spanish (`TiSpeechNative.SynthesisLanguages`).
 The complete text-to-audio path has been compared sample for sample with the
-original engine. The `svsay -t "hello world" out.wav` native tool converts plain
-text directly to a WAV file. SoftVoice user dictionaries (`SVXF` files) are
-supported for English via `TiUserDictionary` and
-`NativeTiSpeechBackend.LoadUserDictionary`. Inline synthesis commands remain
-unsupported.
+original engine in both languages. The `svsay -t "hello world" out.wav` native
+tool converts plain text directly to a WAV file (`-s` for Spanish). SoftVoice
+user dictionaries (`SVXF` files) are supported via `TiUserDictionary` and
+`NativeTiSpeechBackend.LoadUserDictionary`.
 
 `NativeTiSpeechBackend` plays synthesized speech through the system player
 (`afplay` on macOS, `paplay`/`aplay` on Linux), so OpenTalkIt's Talk and Export

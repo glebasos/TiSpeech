@@ -65,7 +65,7 @@ FRAME_RATE = 0x1C0120E8
 # Voice-expression tables, TIBASE32!FUN_1c00be40. Bounds derived in
 # include/tispeech/expression.h; VOICE_ROWS is additionally checked below
 # against the NULL name pointer that ends the table.
-FLUTTER = (0x1C001470, 0x100)
+FLUTTER = (0x1C001470, 0x101)   # + the noise table's first byte; see expression.h
 LFO = (0x1C013430, 0x100)
 VOICES = (0x1C013600, 74)
 VOICE_ROWS = 20

@@ -11,6 +11,7 @@ internal interface INativePcmSynthesizer
 {
     TiEngineCapabilities Capabilities { get; }
     TiLanguageFlags Languages { get; }
+    TiLanguageFlags SynthesisLanguages { get; }
     string? UnavailableReason { get; }
     TiSynthesisResult Render(TiLanguage language, string text, TiVoiceOptions options, TiUserDictionary? dictionary);
 }
@@ -19,6 +20,7 @@ internal sealed class NativePcmSynthesizer : INativePcmSynthesizer
 {
     public TiEngineCapabilities Capabilities => TiSpeechNative.Capabilities;
     public TiLanguageFlags Languages => TiSpeechNative.Languages;
+    public TiLanguageFlags SynthesisLanguages => TiSpeechNative.SynthesisLanguages;
     public string? UnavailableReason => !TiSpeechNative.IsAvailable ? TiSpeechNative.UnavailableReason
         : !Capabilities.HasFlag(TiEngineCapabilities.Synthesis)
             ? "English synthesis data is unavailable (TISPEECH_E_NOTIMPL). Rebuild with TIBASE32.DLL and TIENG32.DLL."
@@ -28,7 +30,7 @@ internal sealed class NativePcmSynthesizer : INativePcmSynthesizer
 }
 
 /// <summary>
-/// Native English text-to-speech with asynchronous playback. Each utterance
+/// Native English and Spanish text-to-speech with asynchronous playback. Each utterance
 /// snapshots its voice settings; cancelled work can never start or complete a
 /// replacement utterance. Phoneme previews and PCM export need no audio device.
 /// </summary>
@@ -124,9 +126,11 @@ public sealed class NativeTiSpeechBackend : ITiSpeechBackend, ITiPhonemeProvider
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            _openError = !languages.HasFlag(TiLanguageFlags.English)
-                ? "Native speech currently supports English only."
-                : _synthesizer.UnavailableReason ?? _player.UnavailableReason;
+            _openError = _synthesizer.UnavailableReason
+                ?? ((languages & _synthesizer.SynthesisLanguages) == 0
+                    ? $"Native speech is built for {TiSpeechNative.DescribeLanguages(_synthesizer.SynthesisLanguages)} only."
+                    : null)
+                ?? _player.UnavailableReason;
             if (_openError is not null)
             {
                 _open = false;
