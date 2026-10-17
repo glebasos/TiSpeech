@@ -154,6 +154,7 @@ public static partial class TiSpeechNative
     private static readonly Lock ProbeLock = new();
     private static ImmutableArray<string> _probedPaths = [];
     private static string? _resolvedPath;
+    private static string? _loaderError;
 
     /// <summary>
     /// Registered as a module initializer so the resolver is in place before any
@@ -171,6 +172,8 @@ public static partial class TiSpeechNative
 #pragma warning restore CA2255
     internal static void RegisterResolver()
     {
+        // WebAssembly links libtispeech statically into dotnet.native.wasm.
+        if (OperatingSystem.IsBrowser()) return;
         NativeLibrary.SetDllImportResolver(typeof(TiSpeechNative).Assembly, Resolve);
     }
 
@@ -270,8 +273,11 @@ public static partial class TiSpeechNative
         foreach (var name in names)
         {
             probed.Add($"{name} (OS library search path)");
-            if (NativeLibrary.TryLoad(name, out var handle))
-                return Remember(name, probed, handle);
+            // Load rather than TryLoad: on Android the library always ships in
+            // the APK, so a failure here is a dlopen error (a missing symbol,
+            // say) worth showing, not a missing file.
+            try { return Remember(name, probed, NativeLibrary.Load(name)); }
+            catch (DllNotFoundException ex) { lock (ProbeLock) { _loaderError ??= ex.Message; } }
         }
 
         lock (ProbeLock) { _probedPaths = probed.ToImmutable(); }
@@ -430,6 +436,10 @@ public static partial class TiSpeechNative
             return $"The TiSpeech native library at {_resolvedPath ?? "the resolved path"} is built for a " +
                    $"different architecture than this process ({RuntimeInformation.ProcessArchitecture}). " +
                    "Rebuild the tispeech_shared CMake target for this architecture.";
+
+        if (OperatingSystem.IsAndroid())
+            return $"The TiSpeech native library ({FileNames()[0]}) failed to load: " +
+                   (_loaderError ?? ex.Message);
 
         return $"The TiSpeech native library ({FileNames()[0]}) was not found, so the reconstructed engine's " +
                "features are unavailable. This is expected if you have not built it: it comes from the " +

@@ -11,6 +11,8 @@
          TiSpeechNative.cs adds bindings for the PORTABLE native reconstruction
          (libtispeech.dylib/.so/.dll), which is equally TFM-neutral. -->
     <TargetFramework>net10.0</TargetFramework>
+    <!-- dist/build-legacy-mac.sh: .NET 8's macOS runtime still loads on 10.15/11; .NET 10's needs 12. -->
+    <TargetFramework Condition="'$(OpenTalkItNet8)' == 'true'">net8.0</TargetFramework>
     <AssemblyName>TiSpeech</AssemblyName>
     <RootNamespace>TiSpeech</RootNamespace>
     <Nullable>enable</Nullable>
